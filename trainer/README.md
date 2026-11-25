@@ -8,8 +8,39 @@ Implemented so far:
 2. `build_dataset.py`: turn it into an ML dataset of **30-second candles** with holder counts,
    engineered features and future-return targets. Every input is described in [DATASET.md](DATASET.md).
 3. `build_sequences.py`: tokenized model inputs. For each moment, the last **120 candles** become
-   120 tokens each of candle, volume, holders, top-10 concentration, trades per minute and
-   liquidity. The spec is in [MODEL.md](MODEL.md).
+   120 tokens each of candle, volume, holders, top-10 concentration, trades per minute,
+   liquidity, bonding curve progress, launch bundle, whale buy and whale sell (10 streams).
+   The spec is in [MODEL.md](MODEL.md).
+
+## Data sources
+
+| Source | Script | Gives | Cost |
+|---|---|---|---|
+| **GMGN API** (official) | `download_gmgn.py` | 30s candles from launch (dead coins included), holder history for coins with < 100 wallets, a snapshot per coin (holders, top-10, dev, bundlers, snipers, ...) | GMGN key (free tier ~2 candle requests/s) |
+| **Solana RPC** (on-chain) | `download_data.py` | every swap: exact trade counts, buy/sell, liquidity, holders, top-10, whale buys/sells, launch bundle, exact curve progress per candle | RPC plan |
+
+`build_dataset.py --source auto` (default) uses GMGN candles and fills in on-chain columns wherever on-chain data
+exists. Inputs nobody has data for become `UNKNOWN` tokens, never guessed values.
+
+### GMGN quick start
+
+```bash
+export GMGN_API_KEY=...                                   # create at https://gmgn.ai/ai
+# 1. coins: unbiased sample of past launches (cheap on-chain discovery, works on the free public RPC)
+python download_data.py discover --mode new --limit 1000 --min-age 6h --max-age 3d
+#    ...and/or record every launch going forward from GMGN's live list
+python download_gmgn.py collect --duration 24h
+# 2. 30s candles from launch + snapshot + holder history for every coin in data/tokens.csv
+python download_gmgn.py history
+# 3. build
+python build_dataset.py && python build_sequences.py
+```
+
+GMGN limits: klines have **no trade count and no per-wallet trades**, and there's **no history of top-10 or
+liquidity** (only a current snapshot, saved as `gmgn_*_now` columns in `tokens.csv`). So trades/min, top-10,
+liquidity, whale buy/sell and the launch bundle need on-chain data for the same coins (`download_data.py history`;
+the bundle needs the history back to the coin's creation). Bonding curve progress works from GMGN alone
+(derived from the price). `python download_gmgn.py --demo-key ...` uses GMGN's public test key (testing only).
 
 ## Setup
 
@@ -48,7 +79,7 @@ python download_data.py ohlcv --intervals 15s,1min,15min
 # 3. Build the ML dataset -> data/dataset/dataset_30s.csv + DATASET.md
 python build_dataset.py --interval 30s --horizons 1min,5min,10min --up-threshold 0.10
 
-# 4. Tokenize into 6 x 120-token model inputs -> data/dataset/sequences_30s.npz + MODEL.md
+# 4. Tokenize into 10 x 120-token model inputs -> data/dataset/sequences_30s.npz + MODEL.md
 #    (runs the input verification automatically and fails if any input is wrong)
 python build_sequences.py
 
@@ -72,7 +103,7 @@ data/
   ohlcv/<interval>/<mint>.csv   candles
   state/<mint>.json             pagination cursors + token metadata
   dataset/dataset_30s.csv       ML dataset (features + targets), see DATASET.md
-  dataset/sequences_30s.npz     tokenized 6 x 120 model inputs + targets, see MODEL.md
+  dataset/sequences_30s.npz     tokenized 10 x 120 model inputs + targets, see MODEL.md
 ```
 
 **trades/<mint>.csv**: `signature, slot, tx_index, block_time, datetime, dex, pool_vault, side (buy|sell),

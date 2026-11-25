@@ -14,7 +14,7 @@ from . import tokenizer as tk
 #            special ids that are not part of the ordered scale)
 SPEC = {
     "candle_tokens": (tk.candle_tokens, tk.CANDLE_VOCAB, tk.candle_vocab,
-                      ["open", "high", "low", "close", "trades"], None, ()),
+                      ["open", "high", "low", "close", "trades", "volume_sol"], None, ()),
     "volume_tokens": (tk.volume_tokens, tk.VOLUME_VOCAB, tk.volume_vocab,
                       ["volume_sol"], "volume_sol", (tk.PAD, tk.VOLUME_ZERO)),
     "holder_tokens": (tk.holder_tokens, tk.HOLDERS_VOCAB, tk.holders_vocab,
@@ -22,12 +22,24 @@ SPEC = {
     "top10_tokens": (tk.top10_tokens, tk.TOP10_VOCAB, tk.top10_vocab,
                      ["top10_pct"], "top10_pct", (tk.PAD, tk.TOP10_UNKNOWN)),
     "trades_tokens": (tk.trades_tokens, tk.TRADES_VOCAB, tk.trades_vocab,
-                      ["trades_per_min"], "trades_per_min", (tk.PAD, tk.TRADES_ZERO)),
+                      ["trades_per_min"], "trades_per_min", (tk.PAD, tk.TRADES_ZERO, tk.TRADES_UNKNOWN)),
     "liquidity_tokens": (tk.liquidity_tokens, tk.LIQ_VOCAB, tk.liquidity_vocab,
                          ["liquidity_sol"], "liquidity_sol", (tk.PAD, tk.LIQ_UNKNOWN)),
+    "curve_tokens": (tk.curve_tokens, tk.CURVE_VOCAB, tk.curve_vocab,
+                     ["curve_progress_pct", "graduated"], "curve_progress_pct",
+                     (tk.PAD, tk.CURVE_UNKNOWN, tk.CURVE_GRADUATED)),
+    "bundle_tokens": (tk.bundle_tokens, tk.BUNDLE_VOCAB, tk.bundle_vocab,
+                      ["bundle_pct", "bundle_launch_pct"], "bundle_pct",
+                      (tk.PAD, tk.BUNDLE_UNKNOWN, tk.BUNDLE_NONE, tk.BUNDLE_SOLD_OUT)),
+    "whale_buy_tokens": (tk.whale_buy_tokens, tk.WHALE_VOCAB, tk.whale_buy_vocab,
+                         ["max_buy_sol"], "max_buy_sol", (tk.PAD, tk.WHALE_NONE, tk.WHALE_UNKNOWN)),
+    "whale_sell_tokens": (tk.whale_sell_tokens, tk.WHALE_VOCAB, tk.whale_sell_vocab,
+                          ["max_sell_sol"], "max_sell_sol", (tk.PAD, tk.WHALE_NONE, tk.WHALE_UNKNOWN)),
 }
 UNKNOWN_IDS = {"holder_tokens": tk.HOLDERS_UNKNOWN, "top10_tokens": tk.TOP10_UNKNOWN,
-               "liquidity_tokens": tk.LIQ_UNKNOWN}
+               "liquidity_tokens": tk.LIQ_UNKNOWN, "trades_tokens": tk.TRADES_UNKNOWN,
+               "curve_tokens": tk.CURVE_UNKNOWN, "bundle_tokens": tk.BUNDLE_UNKNOWN,
+               "whale_buy_tokens": tk.WHALE_UNKNOWN, "whale_sell_tokens": tk.WHALE_UNKNOWN}
 
 
 class Report:

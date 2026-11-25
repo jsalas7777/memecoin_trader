@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Build tokenized model inputs: 6 streams x 120 tokens.
+"""Build tokenized model inputs: 10 streams x 120 tokens.
 
-Streams: candle, volume, holders, top-10 concentration, trades per minute, liquidity.
+Streams: candle, volume, holders, top-10 concentration, trades per minute, liquidity,
+bonding curve progress, launch bundle, whale buy, whale sell.
 
 Reads data/dataset/dataset_30s.csv (from build_dataset.py). For every candle t of every
 token, it takes the window of the last 120 candles (t-119 .. t), converts each candle into
@@ -38,15 +39,23 @@ STREAMS = {
     "top10_tokens": (tk.top10_tokens, tk.TOP10_VOCAB, tk.top10_vocab),
     "trades_tokens": (tk.trades_tokens, tk.TRADES_VOCAB, tk.trades_vocab),
     "liquidity_tokens": (tk.liquidity_tokens, tk.LIQ_VOCAB, tk.liquidity_vocab),
+    "curve_tokens": (tk.curve_tokens, tk.CURVE_VOCAB, tk.curve_vocab),
+    "bundle_tokens": (tk.bundle_tokens, tk.BUNDLE_VOCAB, tk.bundle_vocab),
+    "whale_buy_tokens": (tk.whale_buy_tokens, tk.WHALE_VOCAB, tk.whale_buy_vocab),
+    "whale_sell_tokens": (tk.whale_sell_tokens, tk.WHALE_VOCAB, tk.whale_sell_vocab),
 }
 # stream -> source columns in dataset_30s.csv
 STREAM_SOURCES = {
-    "candle_tokens": "`open`, `high`, `low`, `close`, `trades`",
+    "candle_tokens": "`open`, `high`, `low`, `close`, `volume_sol`",
     "volume_tokens": "`volume_sol`",
     "holder_tokens": "`holders`",
     "top10_tokens": "`top10_pct`",
     "trades_tokens": "`trades_per_min`",
     "liquidity_tokens": "`liquidity_sol`",
+    "curve_tokens": "`curve_progress_pct`, `graduated`",
+    "bundle_tokens": "`bundle_pct`, `bundle_launch_pct`",
+    "whale_buy_tokens": "`max_buy_sol`",
+    "whale_sell_tokens": "`max_sell_sol`",
 }
 # stream -> (title, what one token encodes)
 STREAM_DOCS = {
@@ -56,6 +65,10 @@ STREAM_DOCS = {
     "top10_tokens": ("Top-10 concentration", "% of supply held by the 10 largest wallets"),
     "trades_tokens": ("Trades per minute", "swaps in the last 60 seconds"),
     "liquidity_tokens": ("Liquidity", "total SOL in the coin's pools (log scale)"),
+    "curve_tokens": ("Bonding curve progress", "% of the pump.fun curve sold, or GRADUATED"),
+    "bundle_tokens": ("Launch bundle", "% of supply the launch-block wallets still hold"),
+    "whale_buy_tokens": ("Whale buy", "biggest buy by one wallet in the candle (SOL, log scale)"),
+    "whale_sell_tokens": ("Whale sell", "biggest sell by one wallet in the candle (SOL, log scale)"),
 }
 
 
@@ -149,6 +162,8 @@ def write_markdown(args, arrays: dict | None, report: Report | None = None) -> N
 - Candles are evenly spaced. A 30s period with no swaps is still a step, with the tokens
   `NO_TRADE` (candle) and `ZERO` (volume).
 - Only data up to the close of candle *t* is used, so there is no look-ahead.
+- Candles come from GMGN (30s klines from launch) and/or on-chain swaps; see the `source` column.
+  A value no source has data for is the stream's `UNKNOWN` token, never a guess.
 """)
     L.append("## ⭐ Input 1: `candle_tokens` [batch, 120]\n")
     L.append(f"""Each candle with at least one swap becomes one of {tk.N_RET} x {tk.N_RANGE} = {tk.N_RET * tk.N_RANGE} tokens:
@@ -170,27 +185,59 @@ very different things for a memecoin. A candle with no volume is `ZERO`.
     L.append("## ⭐ Input 3: `holder_tokens` [batch, 120]\n")
     L.append(f"""Number of wallets holding > 0 tokens at the close of each candle. 1-{tk.HOLDERS_EXACT} holders each have
 their own token. Above that, each bin covers {round((tk.HOLDERS_STEP - 1) * 100)}% more holders than the previous one, so growth
-from 1,000 to 1,050 holders is still visible. `UNKNOWN` means no balance data was available.
-The holder history is rebuilt from on-chain balances (see [DATASET.md](DATASET.md)).
+from 1,000 to 1,050 holders is still visible. `UNKNOWN` means no holder history is available.
+Holder history comes from exact on-chain balances, or else from GMGN wallet holding periods
+(exact for coins with fewer than 100 wallets, which covers most dead coins). See [DATASET.md](DATASET.md).
 """)
     L.append("## ⭐ Input 4: `top10_tokens` [batch, 120]\n")
     L.append(f"""% of the total supply held by the 10 largest wallets at candle close, in {tk.TOP10_STEP_PCT:g}% steps
 ({tk.TOP10_BINS} bins from 0% to 100%). Pools, bonding curves and other program-owned (PDA) accounts are
 excluded, because they're liquidity, not people who can dump. A high or rising value means a few
 wallets can crash the price. A falling value means big holders are selling or distributing.
-`UNKNOWN` means no balance data was available.
+`UNKNOWN` means no balance data was available. This stream needs on-chain data, because GMGN
+has no top-10 history.
 """)
     L.append("## ⭐ Input 5: `trades_tokens` [batch, 120]\n")
     L.append(f"""Number of swaps in the last 60 seconds (the current 30s candle plus the previous one).
 1-{tk.TRADES_EXACT} trades/min each have their own token. Above that, each bin covers {round((tk.TRADES_STEP - 1) * 100)}% more
 trades/min than the previous one. `ZERO` = no trades in the last minute (activity is dying).
+`UNKNOWN` = the trade count isn't available (GMGN candles have volume but no trade count; it is
+filled from on-chain data where that exists).
 """)
     L.append("## ⭐ Input 6: `liquidity_tokens` [batch, 120]\n")
     L.append(f"""Total SOL in all of the coin's pools at candle close (pump.fun bonding curve + PumpSwap /
 Raydium / Meteora pools), on a log10 scale in {tk.LIQ_STEP:g}-decade steps (each bin ~{10 ** tk.LIQ_STEP:.2f}x the
 previous) from {10 ** tk.LIQ_LOG10_MIN:g} SOL to {10 ** tk.LIQ_LOG10_MAX:,.0f} SOL. When a coin graduates, the emptied
 bonding curve stops counting, so liquidity is not double-counted. A sudden drop in this
-stream is liquidity being pulled.
+stream is liquidity being pulled. This stream needs on-chain data (GMGN has no liquidity
+history); it is `UNKNOWN` otherwise.
+""")
+    L.append("## ⭐ Input 7: `curve_tokens` [batch, 120]\n")
+    L.append(f"""How far the coin is along the pump.fun bonding curve at candle close, in {tk.CURVE_STEP_PCT:g}% steps
+({tk.CURVE_BINS} bins). 0% = just launched; 100% = all 793.1M sellable tokens bought and the curve is complete.
+`GRADUATED` = the coin has moved to an AMM (PumpSwap, Raydium, ...). Many coins stall and die
+just before completing the curve, and graduation itself often triggers a dump.
+On-chain: exact, from the tokens left in the curve's vault (1B at launch, 206.9M at completion).
+GMGN: from the price, using the curve's constant-product formula (within ~1 point), and
+`GRADUATED` from GMGN's migration time. `UNKNOWN` = not a pump.fun coin.
+""")
+    L.append("## ⭐ Input 8: `bundle_tokens` [batch, 120]\n")
+    L.append(f"""% of the total supply still held by the wallets that bought in the **launch block** (the same
+slot as the create transaction: the dev's own buy plus any wallets bundled with it), at candle close.
+1% steps up to 20%, then 5% steps. A big bundle means a few insiders control the supply; the
+stream falling means they are selling into buyers.
+`NO_BUNDLE` = nobody bought in the launch block. `SOLD_OUT` = they bought and have sold
+(less than {tk.BUNDLE_SOLD_OUT_PCT:g}% of supply left). `UNKNOWN` = the downloaded history doesn't reach back to the
+launch, or the candles are GMGN-only (this stream needs on-chain data from creation).
+Program-owned (PDA) accounts such as the curve itself are never counted.
+""")
+    L.append("## ⭐ Inputs 9 and 10: `whale_buy_tokens`, `whale_sell_tokens` [batch, 120]\n")
+    L.append(f"""The biggest amount of SOL **one wallet** bought (input 9) and sold (input 10) in the candle.
+A wallet's swaps in the same candle are added up, so splitting a buy into small swaps doesn't
+hide it. Same log scale as volume ({10 ** tk.VOL_LOG10_MIN:g} SOL to {10 ** tk.VOL_LOG10_MAX:g} SOL, {tk.VOL_STEP:g}-decade steps).
+Together with volume, it shows whether a move is one whale or many small traders; a whale
+sell next to thin liquidity is a dump warning. `NONE` = no buys (sells) in the candle.
+`UNKNOWN` = per-wallet amounts not available (GMGN candles have no trade list; on-chain fills it).
 """)
     L.append("## Targets\n")
     L.append("Each sample carries the targets of its current candle *t*, from `build_dataset.py`:\n")
@@ -212,7 +259,11 @@ volume_tokens    ─ Embedding({tk.VOLUME_VOCAB}, d) ─┤
 holder_tokens    ─ Embedding({tk.HOLDERS_VOCAB}, d) ┤
 top10_tokens     ─ Embedding({tk.TOP10_VOCAB}, d) ─┼─ sum ─ + positional embedding({args.seq_len}, d)
 trades_tokens    ─ Embedding({tk.TRADES_VOCAB}, d) ─┤
-liquidity_tokens ─ Embedding({tk.LIQ_VOCAB}, d) ─┘
+liquidity_tokens ─ Embedding({tk.LIQ_VOCAB}, d) ─┤
+curve_tokens     ─ Embedding({tk.CURVE_VOCAB}, d) ─┤
+bundle_tokens    ─ Embedding({tk.BUNDLE_VOCAB}, d) ─┤
+whale_buy_tokens ─ Embedding({tk.WHALE_VOCAB}, d) ─┤
+whale_sell_tokens─ Embedding({tk.WHALE_VOCAB}, d) ─┘
       └─> Transformer encoder (causal or bidirectional, PAD masked)
             └─> representation at position {args.seq_len - 1} (current candle)
                   └─> heads: P(up 5m) [BCE], P(dump 5m) [BCE], return 5m [MSE]
@@ -231,7 +282,8 @@ or a focal loss rather than by removing dead coins. When evaluating, check
 import numpy as np
 d = np.load("data/dataset/sequences_30s.npz")
 streams = ["candle_tokens", "volume_tokens", "holder_tokens",
-           "top10_tokens", "trades_tokens", "liquidity_tokens"]
+           "top10_tokens", "trades_tokens", "liquidity_tokens",
+           "curve_tokens", "bundle_tokens", "whale_buy_tokens", "whale_sell_tokens"]
 x = np.stack([d[k] for k in streams], axis=-1)  # [N, {args.seq_len}, {len(STREAMS)}]
 y = d["target_up_5m"]
 train = d["split"] == "train"

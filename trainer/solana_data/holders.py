@@ -97,3 +97,50 @@ def holder_stats(balances: pd.DataFrame | None, interval: str, supply: float | N
     if current is not None:
         snapshot(current)
     return pd.DataFrame(rows, index=pd.DatetimeIndex(index), columns=cols)
+
+
+def bundle_stats(balances: pd.DataFrame | None, interval: str, supply: float | None,
+                 launch_slot: int | None) -> tuple[pd.DataFrame, dict]:
+    """Launch-bundle detection and what the bundle still holds over time.
+
+    Bundle wallets = every wallet (program-owned/PDA accounts excluded) whose balance went
+    up in the coin's launch slot, the same block as the create transaction. That includes
+    the dev's own buy in the create tx and any wallets that bought in the same block
+    (usually a Jito bundle controlled by the dev or a sniper group).
+
+    Returns (per-candle frame with `bundle_pct` = % of supply the bundle wallets hold at
+    candle close, {"bundle_launch_pct": % of supply bought in the launch slot,
+    "bundle_wallets": number of bundle wallets}).
+    Needs the coin's history from creation (launch_slot); otherwise everything is unknown.
+    """
+    unknown = (pd.DataFrame(columns=["bundle_pct"], dtype="float64"),
+               {"bundle_launch_pct": float("nan"), "bundle_wallets": float("nan")})
+    if balances is None or balances.empty or launch_slot is None or not supply:
+        return unknown
+    b = balances.dropna(subset=["block_time"]).sort_values(["slot", "tx_index"], na_position="last")
+    launch = b[b["slot"] == launch_slot]
+    start: dict[str, float] = {}
+    for acct, owner, bal in zip(launch["account"], launch["owner"], launch["balance"]):
+        if not _is_program_owned(owner):
+            start[acct] = bal  # last balance in the launch slot
+    owners = {o for a, o in zip(launch["account"], launch["owner"]) if a in start and start[a] > _EPS}
+    accounts = {a for a in start if start[a] > _EPS}
+    launch_pct = 100 * sum(start[a] for a in accounts) / supply
+    info = {"bundle_launch_pct": launch_pct, "bundle_wallets": float(len(owners))}
+    if not owners:
+        return pd.DataFrame(columns=["bundle_pct"], dtype="float64"), info
+
+    # replay every account owned by a bundle wallet (they may buy more / sell later)
+    mine = b[b["owner"].isin(owners)]
+    buckets = pd.to_datetime(mine["block_time"], unit="s", utc=True).dt.floor(interval)
+    held: dict[str, float] = {}
+    rows, index, current = [], [], None
+    for acct, bal, bucket in zip(mine["account"], mine["balance"], buckets):
+        if current is not None and bucket != current:
+            index.append(current)
+            rows.append(100 * sum(held.values()) / supply)
+        current = bucket
+        held[acct] = bal
+    index.append(current)
+    rows.append(100 * sum(held.values()) / supply)
+    return pd.DataFrame({"bundle_pct": rows}, index=pd.DatetimeIndex(index)), info

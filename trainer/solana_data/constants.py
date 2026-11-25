@@ -39,3 +39,13 @@ NON_MEME_MINTS = set(QUOTE_MINTS) | {
 }
 
 LAMPORTS_PER_SOL = 1_000_000_000
+
+# pump.fun bonding curve (constant product on virtual reserves). Every coin starts with
+# 1B tokens in the curve's vault; 793.1M of them can be bought on the curve, and the last
+# 206.9M stay in the vault until migration. The curve completes ("graduates") when the
+# vault is down to those 206.9M.
+PUMP_CURVE_START_TOKENS = 1_000_000_000
+PUMP_CURVE_RESERVED_TOKENS = 206_900_000
+PUMP_CURVE_SELLABLE_TOKENS = PUMP_CURVE_START_TOKENS - PUMP_CURVE_RESERVED_TOKENS  # 793.1M
+PUMP_VIRTUAL_TOKENS = 1_073_000_000
+PUMP_VIRTUAL_SOL = 30.0

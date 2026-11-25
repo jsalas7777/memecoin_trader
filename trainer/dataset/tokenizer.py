@@ -7,6 +7,10 @@ Each candle produces one token per input stream:
   top10     : % of supply held by the 10 largest wallets (2.5% steps)
   trades    : trades per minute (exact up to 10, then 25% steps)
   liquidity : total SOL in the coin's pools on a log scale (~26% steps)
+  curve     : pump.fun bonding curve progress (2.5% steps), or GRADUATED
+  bundle    : % of supply the launch-block (bundle) wallets still hold
+  whale_buy : biggest buy by one wallet in the candle (SOL, log scale)
+  whale_sell: biggest sell by one wallet in the candle (SOL, log scale)
 
 Id 0 is always PAD (left padding for tokens with < 120 candles of history).
 """
@@ -58,11 +62,12 @@ TOP10_VOCAB = TOP10_OFFSET + TOP10_BINS  # 42
 
 # ---- trades-per-minute stream --------------------------------------------------
 TRADES_ZERO = 1
+TRADES_UNKNOWN = 2       # trade count not available (e.g. GMGN-only candles)
 TRADES_EXACT = 10        # 1..10 trades/min each get their own token
 TRADES_STEP = 1.25       # above 10, each bin is 25% more trades/min
 TRADES_LOG_BINS = 36     # 10 * 1.25^36 ~ 30k trades/min
-TRADES_OFFSET = 2
-TRADES_VOCAB = TRADES_OFFSET + TRADES_EXACT + TRADES_LOG_BINS  # 48
+TRADES_OFFSET = 3
+TRADES_VOCAB = TRADES_OFFSET + TRADES_EXACT + TRADES_LOG_BINS  # 49
 
 # ---- liquidity stream ----------------------------------------------------------
 LIQ_UNKNOWN = 1
@@ -70,6 +75,32 @@ LIQ_LOG10_MIN, LIQ_LOG10_MAX, LIQ_STEP = -2.0, 5.0, 0.1   # 0.01 SOL .. 100k SOL
 LIQ_EDGES = np.round(np.arange(LIQ_LOG10_MIN, LIQ_LOG10_MAX + 1e-9, LIQ_STEP), 6)  # 71 edges -> 72 bins
 LIQ_OFFSET = 2
 LIQ_VOCAB = LIQ_OFFSET + len(LIQ_EDGES) + 1  # 74
+
+
+# ---- bonding curve stream -----------------------------------------------------
+CURVE_UNKNOWN = 1        # not a pump.fun coin, or no data
+CURVE_GRADUATED = 2      # left the curve for an AMM
+CURVE_STEP_PCT = 2.5
+CURVE_BINS = int(100 / CURVE_STEP_PCT)  # 40
+CURVE_OFFSET = 3
+CURVE_VOCAB = CURVE_OFFSET + CURVE_BINS  # 43
+
+# ---- launch bundle stream ------------------------------------------------------
+BUNDLE_UNKNOWN = 1       # history doesn't reach back to the launch block
+BUNDLE_NONE = 2          # nobody bought in the launch block
+BUNDLE_SOLD_OUT = 3      # the launch-block wallets bought, and have sold (almost) everything
+BUNDLE_SOLD_OUT_PCT = 0.05  # below this % of supply counts as sold out
+# % of supply still held: 1% steps up to 20%, then 5% steps
+BUNDLE_EDGES = [float(x) for x in range(1, 21)] + [float(x) for x in range(25, 100, 5)]  # 35 edges -> 36 bins
+BUNDLE_OFFSET = 4
+BUNDLE_VOCAB = BUNDLE_OFFSET + len(BUNDLE_EDGES) + 1  # 40
+
+# ---- whale buy / sell streams --------------------------------------------------
+WHALE_NONE = 1           # no buys (sells) in the candle
+WHALE_UNKNOWN = 2        # per-wallet amounts not available (GMGN-only candles)
+WHALE_OFFSET = 3
+WHALE_EDGES = VOL_EDGES  # same log10 scale as volume: 0.001 .. 1000 SOL, 0.25-decade steps
+WHALE_VOCAB = WHALE_OFFSET + len(WHALE_EDGES) + 1  # 29
 
 
 def _ret_bin(ret_pct: np.ndarray) -> np.ndarray:
@@ -86,7 +117,8 @@ def candle_tokens(c: pd.DataFrame) -> np.ndarray:
     rb = _ret_bin(np.nan_to_num(ret_pct))
     gb = np.searchsorted(RANGE_EDGES_PCT, np.nan_to_num(range_pct), side="right")
     tok = CANDLE_OFFSET + rb * N_RANGE + gb
-    return np.where(c["trades"].to_numpy() > 0, tok, CANDLE_NO_TRADE).astype(np.int16)
+    traded = (np.nan_to_num(c["trades"].to_numpy(float)) > 0) | (c["volume_sol"].to_numpy(float) > 0)
+    return np.where(traded, tok, CANDLE_NO_TRADE).astype(np.int16)
 
 
 def volume_tokens(c: pd.DataFrame) -> np.ndarray:
@@ -125,7 +157,8 @@ def trades_tokens(c: pd.DataFrame) -> np.ndarray:
     exact = np.ceil(tpm) - 1  # (0,1] -> 0, (1,2] -> 1, ... (9,10] -> 9
     b = np.where(tpm <= TRADES_EXACT, exact, np.maximum(geo, TRADES_EXACT))
     b = np.clip(np.nan_to_num(b), 0, TRADES_EXACT + TRADES_LOG_BINS - 1).astype(int)
-    return np.where(np.nan_to_num(tpm) > 0, TRADES_OFFSET + b, TRADES_ZERO).astype(np.int16)
+    tok = np.where(np.nan_to_num(tpm) > 0, TRADES_OFFSET + b, TRADES_ZERO)
+    return np.where(np.isnan(tpm), TRADES_UNKNOWN, tok).astype(np.int16)
 
 
 def liquidity_tokens(c: pd.DataFrame) -> np.ndarray:
@@ -134,6 +167,39 @@ def liquidity_tokens(c: pd.DataFrame) -> np.ndarray:
         lv = np.log10(np.where(liq > 0, liq, np.nan))
     b = np.searchsorted(LIQ_EDGES, np.nan_to_num(lv, nan=-99), side="right")
     return np.where(np.isnan(liq), LIQ_UNKNOWN, LIQ_OFFSET + b).astype(np.int16)
+
+
+def curve_tokens(c: pd.DataFrame) -> np.ndarray:
+    pct = c["curve_progress_pct"].to_numpy(float)
+    grad = c["graduated"].to_numpy(float)
+    b = np.clip(np.floor(np.nan_to_num(pct) / CURVE_STEP_PCT), 0, CURVE_BINS - 1).astype(int)
+    tok = np.where(grad == 1, CURVE_GRADUATED, CURVE_OFFSET + b)
+    return np.where(np.isnan(pct) | np.isnan(grad), CURVE_UNKNOWN, tok).astype(np.int16)
+
+
+def bundle_tokens(c: pd.DataFrame) -> np.ndarray:
+    held = c["bundle_pct"].to_numpy(float)
+    launch = c["bundle_launch_pct"].to_numpy(float)
+    b = np.searchsorted(BUNDLE_EDGES, np.nan_to_num(held), side="left")
+    tok = np.where(held < BUNDLE_SOLD_OUT_PCT, BUNDLE_SOLD_OUT, BUNDLE_OFFSET + b)
+    tok = np.where(launch <= 0, BUNDLE_NONE, tok)
+    return np.where(np.isnan(launch) | (np.isnan(held) & (launch > 0)), BUNDLE_UNKNOWN, tok).astype(np.int16)
+
+
+def _whale_tokens(v: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lv = np.log10(np.where(v > 0, v, np.nan))
+    b = np.searchsorted(WHALE_EDGES, np.nan_to_num(lv, nan=-99), side="right")
+    tok = np.where(np.nan_to_num(v) > 0, WHALE_OFFSET + b, WHALE_NONE)
+    return np.where(np.isnan(v), WHALE_UNKNOWN, tok).astype(np.int16)
+
+
+def whale_buy_tokens(c: pd.DataFrame) -> np.ndarray:
+    return _whale_tokens(c["max_buy_sol"].to_numpy(float))
+
+
+def whale_sell_tokens(c: pd.DataFrame) -> np.ndarray:
+    return _whale_tokens(c["max_sell_sol"].to_numpy(float))
 
 
 def windows(tokens: np.ndarray, ends: np.ndarray, seq_len: int = SEQ_LEN) -> np.ndarray:
@@ -207,7 +273,8 @@ def top10_vocab() -> list[tuple[int, str]]:
 
 
 def trades_vocab() -> list[tuple[int, str]]:
-    out = [(PAD, "PAD"), (TRADES_ZERO, "ZERO (no trades in the last minute)")]
+    out = [(PAD, "PAD"), (TRADES_ZERO, "ZERO (no trades in the last minute)"),
+           (TRADES_UNKNOWN, "UNKNOWN (trade count not available for this candle)")]
     for k in range(1, TRADES_EXACT + 1):
         out.append((TRADES_OFFSET + k - 1, f"{k} trade{'s' if k > 1 else ''}/min"))
     n = TRADES_EXACT + TRADES_LOG_BINS
@@ -232,3 +299,43 @@ def liquidity_vocab() -> list[tuple[int, str]]:
         out.append((LIQ_OFFSET + i, f"{_sol(edges[i - 1])} - {_sol(edges[i])} SOL"))
     out.append((LIQ_OFFSET + len(edges), f">= {_sol(edges[-1])} SOL"))
     return out
+
+
+def curve_vocab() -> list[tuple[int, str]]:
+    out = [(PAD, "PAD"), (CURVE_UNKNOWN, "UNKNOWN (not a pump.fun coin, or no data)"),
+           (CURVE_GRADUATED, "GRADUATED (left the bonding curve, trades on an AMM)")]
+    for b in range(CURVE_BINS):
+        lo, hi = b * CURVE_STEP_PCT, (b + 1) * CURVE_STEP_PCT
+        out.append((CURVE_OFFSET + b, f"curve {lo:g}% - {hi:g}% complete"))
+    return out
+
+
+def bundle_vocab() -> list[tuple[int, str]]:
+    out = [(PAD, "PAD"), (BUNDLE_UNKNOWN, "UNKNOWN (history doesn't reach the launch block)"),
+           (BUNDLE_NONE, "NO_BUNDLE (nobody bought in the launch block)"),
+           (BUNDLE_SOLD_OUT, f"SOLD_OUT (launch-block wallets hold < {BUNDLE_SOLD_OUT_PCT:g}% of supply now)")]
+    e = BUNDLE_EDGES
+    out.append((BUNDLE_OFFSET, f"bundle holds {BUNDLE_SOLD_OUT_PCT:g}% - {e[0]:g}%"))
+    for i in range(1, len(e)):
+        out.append((BUNDLE_OFFSET + i, f"bundle holds {e[i - 1]:g}% - {e[i]:g}%"))
+    out.append((BUNDLE_OFFSET + len(e), f"bundle holds > {e[-1]:g}%"))
+    return out
+
+
+def _whale_vocab(side: str) -> list[tuple[int, str]]:
+    out = [(PAD, "PAD"), (WHALE_NONE, f"NONE (no {side}s in this candle)"),
+           (WHALE_UNKNOWN, "UNKNOWN (per-wallet amounts not available)")]
+    edges = [10 ** x for x in WHALE_EDGES]
+    out.append((WHALE_OFFSET, f"biggest {side} < {edges[0]:.4g} SOL"))
+    for i in range(1, len(edges)):
+        out.append((WHALE_OFFSET + i, f"biggest {side} {edges[i - 1]:.4g} - {edges[i]:.4g} SOL"))
+    out.append((WHALE_OFFSET + len(edges), f"biggest {side} >= {edges[-1]:.4g} SOL"))
+    return out
+
+
+def whale_buy_vocab() -> list[tuple[int, str]]:
+    return _whale_vocab("buy")
+
+
+def whale_sell_vocab() -> list[tuple[int, str]]:
+    return _whale_vocab("sell")

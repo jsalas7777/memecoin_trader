@@ -20,9 +20,11 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from dataset.features import FEATURES, ID_COLUMNS, OUTCOME_COLUMNS, make_features, make_targets, target_docs
+from solana_data.constants import PUMP_CURVE_SELLABLE_TOKENS, PUMP_VIRTUAL_SOL, PUMP_VIRTUAL_TOKENS
 from solana_data.ohlcv import build_ohlcv
 
 log = logging.getLogger("dataset")
@@ -86,6 +88,176 @@ def split_segments(candles: pd.DataFrame, gaps: list[tuple[int, int]], interval:
     return c
 
 
+FLOW_COLUMNS = ["trades", "buys", "sells", "unique_traders", "buy_volume_sol", "sell_volume_sol",
+                "max_buy_sol", "max_sell_sol"]
+STATE_COLUMNS = ["sol_reserve", "token_reserve", "liquidity_sol", "holders", "top10_pct",
+                 "curve_progress_pct", "graduated", "bundle_pct"]
+# known once at launch, the same on every candle of the coin
+COIN_COLUMNS = ["bundle_launch_pct", "bundle_wallets"]
+# on-chain value first, GMGN's own estimate where on-chain data doesn't cover the candle
+GMGN_FALLBACK = {"holders", "curve_progress_pct", "graduated"}
+
+
+def is_pump_coin(mint: str, state: dict) -> bool:
+    pools = (state.get("pools") or {}).values()
+    return any(p.get("dex") == "pumpfun" for p in pools) or mint.endswith("pump")
+
+
+def launch_slot(balances: pd.DataFrame | None, state: dict) -> int | None:
+    """Slot of the create tx, known only when the bonding curve's history was downloaded
+    back to creation (the create tx is the curve vault's first transaction)."""
+    pools = (state.get("pools") or {}).values()
+    if balances is None or balances.empty or not any(p.get("dex") == "pumpfun" and p.get("complete") for p in pools):
+        return None
+    return int(balances["slot"].min())
+
+
+def curve_progress_from_price(price_sol: pd.Series) -> pd.Series:
+    """pump.fun curve progress in % from the price (SOL per token), using the curve's
+    constant product of virtual reserves: price = k / virtual_tokens^2. Used for GMGN
+    candles, where the curve's reserves aren't known. Accurate to ~1 point (fees and the
+    5-minute SOL/USD conversion blur the price slightly)."""
+    k = PUMP_VIRTUAL_SOL * PUMP_VIRTUAL_TOKENS
+    virtual_tokens = np.sqrt(k / price_sol.where(price_sol > 0))
+    return ((PUMP_VIRTUAL_TOKENS - virtual_tokens) / PUMP_CURVE_SELLABLE_TOKENS * 100).clip(0, 100)
+
+
+def onchain_candles(data: Path, mint: str, args, max_h) -> tuple[pd.DataFrame | None, dict]:
+    trades = pd.read_csv(data / "trades" / f"{mint}.csv")
+    if len(trades) < args.min_trades:
+        return None, {"skip": f"{len(trades)} on-chain trades"}
+    state_path = data / "state" / f"{mint}.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    bal_path = data / "balances" / f"{mint}.csv"
+    balances = pd.read_csv(bal_path) if bal_path.exists() else None
+    # The download fetched every trade up to `updated_at`. If the coin stopped trading
+    # before that, the empty candles after its last trade are real ("it died"), so the
+    # series is extended far enough that every real candle gets complete targets.
+    observed = state.get("updated_at")
+    end_time = None
+    if observed:
+        last_trade = pd.to_datetime(trades["block_time"].max(), unit="s", utc=True)
+        end_time = min(pd.to_datetime(observed, unit="s", utc=True), last_trade + max_h)
+    candles = build_ohlcv(trades, args.interval, supply=state.get("supply"), balances=balances, end_time=end_time,
+                          pump_curve=is_pump_coin(mint, state), launch_slot=launch_slot(balances, state))
+    gaps = uncovered_intervals(trades, state)
+    candles = split_segments(candles, gaps, args.interval)
+    if candles.empty:
+        return None, {"skip": "no on-chain candles"}
+    return candles, {"trades": trades, "supply": state.get("supply"), "observed": observed,
+                     "symbol": state.get("symbol"), "gaps": len(gaps),
+                     "graduated": int((trades["dex"] != "pumpfun").any())}
+
+
+def gmgn_candles(data: Path, mint: str, args, max_h) -> tuple[pd.DataFrame | None, dict]:
+    """GMGN 30s klines -> evenly spaced candles. GMGN omits candles without trades, so missing
+    candles are known-empty (volume 0, 0 trades). Columns GMGN can't provide (trade counts on
+    traded candles, buy/sell split, liquidity, holders, top-10) are NaN = unknown."""
+    k = pd.read_csv(data / "gmgn" / "kline_30s" / f"{mint}.csv")
+    k = k.dropna(subset=["close"])
+    if k.empty:
+        return None, {"skip": "no GMGN candles"}
+    sp = data / "gmgn" / "state" / f"{mint}.json"
+    st = json.loads(sp.read_text()) if sp.exists() else {}
+    k["ts"] = pd.to_datetime(k["time"], unit="s", utc=True)
+    k = k.set_index("ts").sort_index()
+    r = k.resample(args.interval, label="left", closed="left")
+    out = pd.DataFrame({"open": r["open"].first(), "high": r["high"].max(), "low": r["low"].min(),
+                        "close": r["close"].last(), "volume_sol": r["volume_sol"].sum(),
+                        "volume_token": r["volume_token"].sum()})
+    out = out[out["close"].notna()]
+    end = out.index[-1]
+    if st.get("fetched_at"):
+        end = max(end, min(pd.to_datetime(st["fetched_at"], unit="s", utc=True), out.index[-1] + max_h)
+                  .floor(args.interval))
+    traded = out.index
+    out = out.reindex(pd.date_range(out.index[0], end, freq=args.interval, tz="UTC"))
+    empty = ~out.index.isin(traded)
+    out["close"] = out["close"].ffill()
+    for c in ("open", "high", "low"):
+        out[c] = out[c].fillna(out["close"])
+    out[["volume_sol", "volume_token"]] = out[["volume_sol", "volume_token"]].fillna(0.0)
+    for c in FLOW_COLUMNS:
+        out[c] = np.where(empty, 0.0, np.nan)
+    for c in STATE_COLUMNS:
+        out[c] = np.nan
+    out.index.name = "timestamp"
+    # Holder history from GMGN holding periods: exact when GMGN returned the full wallet list (< 100).
+    hp = data / "gmgn" / "holders" / f"{mint}.json"
+    if hp.exists():
+        h = json.loads(hp.read_text())
+        if h.get("complete"):
+            close_t = ((out.index + pd.Timedelta(args.interval) - pd.Timestamp(0, tz="UTC"))
+                       // pd.Timedelta(seconds=1)).to_numpy(np.int64)  # candle close, unix s
+            starts = np.array([w["start"] for w in h["wallets"] if w.get("start")], dtype=float)
+            ends = np.array([w["end"] if w.get("end") else np.inf for w in h["wallets"] if w.get("start")], dtype=float)
+            held = (starts[None, :] <= close_t[:, None]) & (ends[None, :] > close_t[:, None])
+            out["holders"] = held.sum(axis=1).astype(float)
+    # Bonding curve progress from the price; graduated from GMGN's migration time.
+    info_path = data / "gmgn" / "info" / f"{mint}.json"
+    info = json.loads(info_path.read_text()) if info_path.exists() else {}
+    pump = mint.endswith("pump") or str(info.get("launchpad") or st.get("launchpad") or "").lower().startswith("pump")
+    for c in COIN_COLUMNS:
+        out[c] = np.nan
+    if pump:
+        close_s = ((out.index + pd.Timedelta(args.interval) - pd.Timestamp(0, tz="UTC"))
+                   // pd.Timedelta(seconds=1)).to_numpy(np.int64)
+        migrated = st.get("migrated_at") or info.get("migrated_timestamp") or 0
+        progress = curve_progress_from_price(out["close"])
+        if migrated:
+            grad = pd.Series(close_s >= int(migrated), index=out.index)
+        elif st.get("graduated"):
+            grad = (progress >= 100).cummax()  # migration time unknown: from the curve's end price on
+        else:
+            grad = pd.Series(False, index=out.index)
+        out["graduated"] = grad.astype(float)
+        out["curve_progress_pct"] = progress.where(~grad, 100.0)
+    supply = st.get("supply")
+    out["market_cap_sol"] = out["close"] * supply if supply else np.nan
+    out = out.reset_index()
+    out["segment"] = 0
+    return out, {"supply": supply, "observed": st.get("fetched_at"), "symbol": st.get("symbol"),
+                 "graduated": st.get("graduated")}
+
+
+def merge_onchain(gm: pd.DataFrame, oc: pd.DataFrame | None) -> pd.DataFrame:
+    """GMGN candles as the base; on-chain columns filled in where on-chain data covers the candle."""
+    if oc is None:
+        return gm
+    base = gm.copy()
+    o = oc.set_index("timestamp")
+    for c in FLOW_COLUMNS + STATE_COLUMNS:
+        vals = base["timestamp"].map(o[c]) if c in o else pd.Series(np.nan, index=base.index)
+        if c in FLOW_COLUMNS:
+            # on an empty candle GMGN already knows the flow is 0
+            vals = vals.where(vals.notna() | (base["volume_sol"] > 0), 0.0)
+        if c in GMGN_FALLBACK:
+            vals = vals.where(vals.notna(), base[c])  # on-chain exact data first, GMGN's estimate otherwise
+        base[c] = vals.to_numpy()
+    for c in COIN_COLUMNS:  # per-coin launch facts apply to every candle
+        known = oc[c].dropna() if c in oc else pd.Series(dtype=float)
+        base[c] = known.iloc[0] if len(known) else np.nan
+    return base
+
+
+def candle_outcomes(c: pd.DataFrame, supply: float | None, observed: int | None, graduated) -> dict:
+    real = c[c["volume_sol"] > 0]
+    if real.empty:
+        return {k: float("nan") for k in OUTCOME_COLUMNS}
+    ath, last = real["high"].max(), real["close"].iloc[-1]
+    first_t = real["timestamp"].iloc[0].timestamp()
+    last_t = real["timestamp"].iloc[-1].timestamp()
+    idle = (observed or last_t) - last_t
+    drawdown = last / ath - 1
+    return {
+        "outcome_dead": int(idle > 3600 or drawdown < -0.9),
+        "outcome_graduated": int(graduated) if graduated is not None and pd.notna(graduated) else float("nan"),
+        "outcome_ath_mcap_sol": ath * supply if supply else float("nan"),
+        "outcome_final_drawdown": drawdown,
+        "outcome_lifetime_s": last_t - first_t,
+    }
+
+
 def coin_outcomes(trades: pd.DataFrame, supply: float | None, observed_until: int | None) -> dict:
     sol = trades[trades["quote"] == "SOL"].sort_values(["slot", "tx_index"], na_position="last")
     if sol.empty:
@@ -114,52 +286,46 @@ def build(args) -> tuple[pd.DataFrame, dict]:
         cat = pd.read_csv(catalog_path)
         if "created_at" in cat.columns:
             created = dict(zip(cat["mint"], cat["created_at"]))
-    for trades_path in sorted((data / "trades").glob("*.csv")):
-        mint = trades_path.stem
-        trades = pd.read_csv(trades_path)
-        if len(trades) < args.min_trades:
-            skipped.append((mint, f"{len(trades)} trades"))
+    onchain_mints = {p.stem for p in (data / "trades").glob("*.csv")} if args.source != "gmgn" else set()
+    gmgn_mints = {p.stem for p in (data / "gmgn" / "kline_30s").glob("*.csv")} if args.source != "onchain" else set()
+    for mint in sorted(onchain_mints | gmgn_mints):
+        oc, oc_info = onchain_candles(data, mint, args, max_h) if mint in onchain_mints else (None, {})
+        gm, gm_info = gmgn_candles(data, mint, args, max_h) if mint in gmgn_mints else (None, {})
+        if oc is None and gm is None:
+            skipped.append((mint, oc_info.get("skip") or gm_info.get("skip") or "no data"))
             continue
-        state_path = data / "state" / f"{mint}.json"
-        state = json.loads(state_path.read_text()) if state_path.exists() else {}
-        bal_path = data / "balances" / f"{mint}.csv"
-        balances = pd.read_csv(bal_path) if bal_path.exists() else None
-
-        # The download fetched every trade up to `updated_at`. If the coin stopped trading
-        # before that, the empty candles after its last trade are real ("it died"), so the
-        # series is extended far enough that every real candle gets complete targets.
-        observed = state.get("updated_at")
-        end_time = None
-        if observed:
-            last_trade = pd.to_datetime(trades["block_time"].max(), unit="s", utc=True)
-            end_time = min(pd.to_datetime(observed, unit="s", utc=True), last_trade + max_h)
-        candles = build_ohlcv(trades, args.interval, supply=state.get("supply"), balances=balances,
-                              end_time=end_time)
-        gaps = uncovered_intervals(trades, state)
-        candles = split_segments(candles, gaps, args.interval)
-        if candles.empty:
-            skipped.append((mint, "no candles"))
-            continue
-        t0 = pd.to_datetime(created[mint], unit="s", utc=True) if pd.notna(created.get(mint)) else \
-            pd.to_datetime(trades["block_time"].min(), unit="s", utc=True)
+        if gm is not None:
+            candles, source = merge_onchain(gm, oc), ("gmgn+onchain" if oc is not None else "gmgn")
+        else:
+            candles, source = oc, "onchain"
+        info = {**gm_info, **{k: v for k, v in oc_info.items() if v is not None}} if gm is not None else oc_info
+        symbol = info.get("symbol") or ""
+        first = candles.loc[candles["volume_sol"] > 0, "timestamp"].min()
+        t0 = pd.to_datetime(created[mint], unit="s", utc=True) if pd.notna(created.get(mint)) else first
         parts = []
         for _, seg in candles.groupby("segment", sort=True):
             seg = seg.reset_index(drop=True)
             parts.append(make_targets(make_features(seg, t0), horizons, args.up_threshold, args.dump_threshold))
         f = pd.concat(parts, ignore_index=True)
-        if gaps:
+        if oc_info.get("gaps") and source == "onchain":
             log.info("  %s: %d coverage gap(s) removed (history not fully downloaded), %d segment(s)",
-                     state.get("symbol") or mint[:8], len(gaps), f["segment"].nunique())
+                     symbol or mint[:8], oc_info["gaps"], f["segment"].nunique())
         f.insert(0, "mint", mint)
-        f.insert(1, "symbol", state.get("symbol") or "")
+        f.insert(1, "symbol", symbol)
         f["split"] = assign_split(mint, args.val, args.test)
-        outcome = coin_outcomes(trades, state.get("supply"), observed)
+        f["source"] = source
+        if source == "onchain":
+            outcome = coin_outcomes(oc_info["trades"], info.get("supply"), info.get("observed"))
+        else:
+            outcome = candle_outcomes(candles, info.get("supply"), info.get("observed"), info.get("graduated"))
         for k, v in outcome.items():
             f[k] = v
-        coins.append({"mint": mint, "symbol": state.get("symbol") or "", "trades": len(trades), **outcome})
+        n_trades = len(oc_info["trades"]) if "trades" in oc_info else None
+        coins.append({"mint": mint, "symbol": symbol, "source": source,
+                      "trades": n_trades if n_trades is not None else "-", **outcome})
         frames.append(f)
-        log.info("%-10s %6d candles  %6d trades  holders=%s", (state.get("symbol") or mint[:8])[:10],
-                 len(f), len(trades), int(f["holders"].iloc[-1]) if f["holders"].notna().any() else "n/a")
+        log.info("%-10s %6d candles  %-13s holders=%s", symbol[:10] or mint[:8], len(f), source,
+                 int(f["holders"].dropna().iloc[-1]) if f["holders"].notna().any() else "unknown")
 
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     target_cols = [c for c in df.columns if c.startswith("target_")]
@@ -263,12 +429,19 @@ def write_markdown(args, df: pd.DataFrame, meta: dict, out_csv: Path) -> None:
         L.append("\n</details>\n")
 
     L.append("## How the inputs are produced\n")
-    L.append("""- **Prices and volume** come from every swap that touched the token's pools (pump.fun bonding
+    L.append("""- **Sources** (`source` column): `gmgn` = GMGN 30s klines from launch; `onchain` = our own swap
+  parsing; `gmgn+onchain` = GMGN candles, with on-chain trade counts, buy/sell, liquidity,
+  holders and top-10 wherever on-chain data covers the candle. Values no source has are NaN
+  in this file and `UNKNOWN` tokens in the model inputs. GMGN prices and volumes (USD) are
+  converted to SOL with GMGN's SOL/USD 5-minute candles.
+- **On-chain prices and volume** come from every swap that touched the token's pools (pump.fun bonding
   curve, PumpSwap, Raydium, Meteora, ...). Price = SOL moved / tokens moved in each swap,
   priced in SOL. Swaps under 0.00001 SOL are ignored as dust.
 - **Candles** are """ + args.interval + """ buckets. Candles with no trades are kept, with zero volume and
   OHLC equal to the previous close, so every token is an evenly spaced series.
-- **Holders** are rebuilt by replaying the exact post-transaction token balance of every wallet
+- **Holders (GMGN)**: from GMGN wallet holding periods (start / end of holding), exact when the coin
+  has fewer than 100 wallets; `UNKNOWN` above that unless on-chain data exists.
+- **Holders (on-chain)** are rebuilt by replaying the exact post-transaction token balance of every wallet
   that appears in a pool transaction. A wallet counts as a holder while its balance is > 0.
   Pool vaults count as holders, the same as on block explorers. Wallets that only received
   tokens by plain transfer and never traded through a pool are not seen, so this is a slight
@@ -309,6 +482,9 @@ def main() -> None:
                    help="price rise that counts as 'up' for target_up_* (default 0.10 = +10%%)")
     p.add_argument("--dump-threshold", type=float, default=0.30,
                    help="price drop that counts as a dump for target_dump_* (default 0.30 = -30%%)")
+    p.add_argument("--source", choices=["auto", "gmgn", "onchain"], default="auto",
+                   help="auto (default): GMGN candles + on-chain columns where available; "
+                        "gmgn: GMGN only; onchain: on-chain only")
     p.add_argument("--min-trades", type=int, default=3,
                    help="skip coins with fewer trades (default 3; keep low so dead coins stay in)")
     p.add_argument("--val", type=float, default=0.15, help="fraction of tokens for validation")

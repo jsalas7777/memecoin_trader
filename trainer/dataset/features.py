@@ -37,6 +37,21 @@ FEATURES: dict[str, tuple[str, str]] = {
     # --- concentration ---
     "top10_pct": ("% of total supply held by the 10 largest wallets (pools and program accounts excluded)", "%"),
     "top10_change_10": ("top10_pct - top10_pct 10 candles ago (negative = big holders selling)", "% points"),
+    # --- pump.fun bonding curve ---
+    "curve_progress_pct": ("pump.fun bonding curve progress at candle close (100 = curve complete / graduated). "
+                           "On-chain: from the curve vault's tokens. GMGN: from the price", "%"),
+    "graduated": ("1 once the bonding curve is complete or the coin trades on an AMM (PumpSwap, Raydium, ...), else 0", "0/1"),
+    "curve_progress_change_10": ("curve_progress_pct - curve_progress_pct 10 candles ago", "% points"),
+    # --- launch bundle ---
+    "bundle_launch_pct": ("% of supply bought in the launch block (same slot as the create tx, dev's buy included)", "%"),
+    "bundle_wallets": ("Wallets that bought in the launch block (1 = only the dev)", "count"),
+    "bundle_pct": ("% of supply the launch-block wallets still hold at candle close", "%"),
+    "bundle_change_10": ("bundle_pct - bundle_pct 10 candles ago (negative = the bundle is selling)", "% points"),
+    # --- whales ---
+    "max_buy_sol": ("Biggest buy by ONE wallet in the candle (its swaps summed), 0 if no buys", "SOL"),
+    "max_sell_sol": ("Biggest sell by ONE wallet in the candle (its swaps summed), 0 if no sells", "SOL"),
+    "max_buy_to_liquidity": ("max_buy_sol / liquidity_sol (how much one wallet moved the pool)", "ratio"),
+    "max_sell_to_liquidity": ("max_sell_sol / liquidity_sol", "ratio"),
     # --- lifecycle ---
     "age_s": ("Seconds since the coin was launched (or since its first downloaded trade if the launch time is unknown)", "s"),
     "candles_since_trade": ("Consecutive candles with no trades up to now (0 = traded this candle)", "count"),
@@ -80,6 +95,7 @@ ID_COLUMNS: dict[str, str] = {
     "timestamp": "Candle open time, UTC",
     "segment": "Contiguous stretch of downloaded data within the coin (0, 1, ...). Windows never cross segments",
     "split": "train / val / test, assigned per token (all rows of a token share a split)",
+    "source": "Where the candles came from: gmgn, onchain, or gmgn+onchain (GMGN candles + on-chain holders/liquidity/trades)",
 }
 
 
@@ -109,6 +125,14 @@ def _safe_div(a, b):
     return a / b.replace(0, np.nan)
 
 
+def _rolling(x: pd.Series, n: int, how: str) -> pd.Series:
+    """Rolling sum/mean that stays NaN if any value in the window is unknown (NaN),
+    instead of silently treating unknown as zero."""
+    r = getattr(x.rolling(n, min_periods=1), how)()
+    unknown = x.isna().astype(int).rolling(n, min_periods=1).sum() > 0
+    return r.mask(unknown)
+
+
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     d = close.diff()
     gain = d.clip(lower=0).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
@@ -125,7 +149,8 @@ def make_features(c: pd.DataFrame, t0: pd.Timestamp | None = None) -> pd.DataFra
     lr = np.log(close).diff()
 
     f["age_s"] = (f["timestamp"] - (t0 if t0 is not None else f["timestamp"].iloc[0])).dt.total_seconds()
-    idle = (f["trades"] == 0).astype(int)
+    # a candle traded if it has volume (GMGN gives volume but no trade count)
+    idle = (f["volume_sol"] <= 0).astype(int)
     f["candles_since_trade"] = idle.groupby((idle == 0).cumsum()).cumsum()
 
     for k in (1, 2, 5, 10, 20):
@@ -147,12 +172,14 @@ def make_features(c: pd.DataFrame, t0: pd.Timestamp | None = None) -> pd.DataFra
 
     f["volume_sol_sum_10"] = f["volume_sol"].rolling(10, min_periods=1).sum()
     f["volume_ratio_10"] = _safe_div(f["volume_sol"], f["volume_sol"].rolling(10, min_periods=1).mean())
-    f["trades_ratio_10"] = _safe_div(f["trades"], f["trades"].rolling(10, min_periods=1).mean())
-    f["avg_trade_sol"] = _safe_div(f["volume_sol"], f["trades"]).fillna(0.0)
-    f["buy_ratio"] = _safe_div(f["buy_volume_sol"], f["volume_sol"]).fillna(0.5)
-    f["buy_count_ratio"] = _safe_div(f["buys"], f["trades"]).fillna(0.5)
+    no_vol = f["volume_sol"] <= 0
+    f["trades_ratio_10"] = _safe_div(f["trades"], _rolling(f["trades"], 10, "mean"))
+    f["avg_trade_sol"] = _safe_div(f["volume_sol"], f["trades"]).mask(no_vol, 0.0)
+    # neutral 0.5 only when there was no trading; NaN when the split is unknown
+    f["buy_ratio"] = _safe_div(f["buy_volume_sol"], f["volume_sol"]).mask(no_vol, 0.5)
+    f["buy_count_ratio"] = _safe_div(f["buys"], f["trades"]).mask(f["trades"] == 0, 0.5)
     f["net_flow_sol"] = f["buy_volume_sol"] - f["sell_volume_sol"]
-    f["net_flow_sol_10"] = f["net_flow_sol"].rolling(10, min_periods=1).sum()
+    f["net_flow_sol_10"] = _rolling(f["net_flow_sol"], 10, "sum")
 
     h = f["holders"]
     f["holders_change_1"] = h.diff(1)
@@ -166,10 +193,14 @@ def make_features(c: pd.DataFrame, t0: pd.Timestamp | None = None) -> pd.DataFra
     step_s = (f["timestamp"].iloc[1] - f["timestamp"].iloc[0]).total_seconds() if len(f) > 1 else 60.0
     n1 = max(1, round(60 / step_s))
     n5 = max(1, round(300 / step_s))
-    f["trades_per_min"] = f["trades"].rolling(n1, min_periods=1).sum() * 60 / (n1 * step_s)
-    f["trades_per_min_5m"] = f["trades"].rolling(n5, min_periods=1).sum() * 60 / (n5 * step_s)
+    f["trades_per_min"] = _rolling(f["trades"], n1, "sum") * 60 / (n1 * step_s)
+    f["trades_per_min_5m"] = _rolling(f["trades"], n5, "sum") * 60 / (n5 * step_s)
 
     f["top10_change_10"] = f["top10_pct"].diff(10)
+    f["curve_progress_change_10"] = f["curve_progress_pct"].diff(10)
+    f["bundle_change_10"] = f["bundle_pct"].diff(10)
+    f["max_buy_to_liquidity"] = _safe_div(f["max_buy_sol"], liq)
+    f["max_sell_to_liquidity"] = _safe_div(f["max_sell_sol"], liq)
     f["log_market_cap"] = np.log1p(f["market_cap_sol"])
     return f.replace([np.inf, -np.inf], np.nan)
 

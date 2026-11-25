@@ -3,13 +3,38 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .holders import holder_stats
+from .constants import PUMP_CURVE_RESERVED_TOKENS, PUMP_CURVE_SELLABLE_TOKENS, PUMP_CURVE_START_TOKENS
+from .holders import bundle_stats, holder_stats
 
 CANDLE_COLUMNS = [
     "timestamp", "open", "high", "low", "close", "volume_sol", "volume_token",
     "buy_volume_sol", "sell_volume_sol", "trades", "buys", "sells", "unique_traders",
     "sol_reserve", "token_reserve", "liquidity_sol", "market_cap_sol", "holders", "top10_pct",
+    "max_buy_sol", "max_sell_sol", "curve_progress_pct", "graduated",
+    "bundle_pct", "bundle_launch_pct", "bundle_wallets",
 ]
+
+
+def curve_progress_from_vault(vault_tokens):
+    """pump.fun bonding curve progress in % from the tokens left in the curve's vault."""
+    return ((PUMP_CURVE_START_TOKENS - vault_tokens) / PUMP_CURVE_SELLABLE_TOKENS * 100).clip(0, 100)
+
+
+def _curve(df: pd.DataFrame, index: pd.DatetimeIndex, interval: str) -> pd.DataFrame:
+    """Per-candle `curve_progress_pct` and `graduated` for a pump.fun coin.
+
+    graduated = 1 from the first trade on any AMM pool, or once the curve vault is down to
+    the 206.9M reserved tokens (curve complete). Before that, progress comes from the
+    curve vault's balance after its latest trade. Unknown (NaN) before the first trade seen.
+    """
+    r = lambda s, how: getattr(s.resample(interval, label="left", closed="left"), how)().reindex(index)
+    curve = df[df["dex"] == "pumpfun"]
+    vault = r(curve["token_reserve"], "last").ffill() if len(curve) else pd.Series(float("nan"), index=index)
+    amm = r((df["dex"] != "pumpfun").astype(float), "max").fillna(0).cummax() > 0
+    done = (vault <= PUMP_CURVE_RESERVED_TOKENS + 1).fillna(False).cummax()
+    grad = (amm | done).astype(float).where(amm | done | vault.notna())
+    progress = curve_progress_from_vault(vault).where(grad == 0, 100.0).where(grad.notna())
+    return pd.DataFrame({"curve_progress_pct": progress, "graduated": grad}, index=index)
 
 
 def _liquidity(df: pd.DataFrame, interval: str) -> pd.Series:
@@ -34,7 +59,8 @@ def _liquidity(df: pd.DataFrame, interval: str) -> pd.Series:
 def build_ohlcv(trades: pd.DataFrame, interval: str = "30s", supply: float | None = None,
                 fill_gaps: bool = True, min_quote: float = 1e-5,
                 balances: pd.DataFrame | None = None,
-                end_time: pd.Timestamp | None = None) -> pd.DataFrame:
+                end_time: pd.Timestamp | None = None,
+                pump_curve: bool = False, launch_slot: int | None = None) -> pd.DataFrame:
     """Build SOL-denominated candles.
 
     interval: any pandas offset alias ("1s", "15s", "1min", "5min", "1h", "1D").
@@ -45,6 +71,9 @@ def build_ohlcv(trades: pd.DataFrame, interval: str = "30s", supply: float | Non
               (wallets holding > 0) and `top10_pct` (% of supply held by the top 10 wallets).
     end_time: extend the series with empty candles up to this time (used for coins that
               stopped trading: "nothing happened" after the last trade is real information).
+    pump_curve: the coin launched on the pump.fun bonding curve (adds curve progress / graduated).
+    launch_slot: slot of the create tx, if the history is complete back to creation
+                 (adds the launch-bundle columns).
     """
     df = trades[(trades["quote"] == "SOL") & (trades["quote_amount"] >= min_quote)].copy()
     df = df.dropna(subset=["block_time"])
@@ -71,13 +100,18 @@ def build_ohlcv(trades: pd.DataFrame, interval: str = "30s", supply: float | Non
     out["sol_reserve"] = r["quote_reserve"].last()
     out["token_reserve"] = r["token_reserve"].last()
     out["liquidity_sol"] = _liquidity(df, interval)
+    # whales: the biggest amount ONE wallet bought / sold in the candle (its swaps summed,
+    # so splitting a buy into several small swaps doesn't hide it)
+    per_wallet = df.groupby([pd.Grouper(freq=interval, label="left", closed="left"), "trader"])
+    out["max_buy_sol"] = per_wallet["buy_sol"].sum().groupby(level=0).max().reindex(out.index).fillna(0.0)
+    out["max_sell_sol"] = per_wallet["sell_sol"].sum().groupby(level=0).max().reindex(out.index).fillna(0.0)
 
     if end_time is not None and fill_gaps:
         end = pd.Timestamp(end_time).floor(interval)
         if end > out.index[-1]:
             out = out.reindex(pd.date_range(out.index[0], end, freq=interval, tz="UTC"))
             for col in ("volume_sol", "volume_token", "buy_volume_sol", "sell_volume_sol",
-                        "trades", "buys", "sells", "unique_traders"):
+                        "trades", "buys", "sells", "unique_traders", "max_buy_sol", "max_sell_sol"):
                 out[col] = out[col].fillna(0)
             out[["trades", "buys", "sells", "unique_traders"]] = out[["trades", "buys", "sells", "unique_traders"]].astype(int)
             out.index.name = "ts"
@@ -88,6 +122,18 @@ def build_ohlcv(trades: pd.DataFrame, interval: str = "30s", supply: float | Non
             out[col] = float("nan")
         else:
             out[col] = hs[col].reindex(hs.index.union(out.index)).ffill().reindex(out.index)
+
+    if pump_curve:
+        out[["curve_progress_pct", "graduated"]] = _curve(df, out.index, interval)
+    else:
+        out["curve_progress_pct"] = out["graduated"] = float("nan")
+    bs, binfo = bundle_stats(balances, interval, supply, launch_slot)
+    out["bundle_launch_pct"] = binfo["bundle_launch_pct"]
+    out["bundle_wallets"] = binfo["bundle_wallets"]
+    if bs.empty:
+        out["bundle_pct"] = 0.0 if binfo["bundle_wallets"] == 0 else float("nan")
+    else:
+        out["bundle_pct"] = bs["bundle_pct"].reindex(bs.index.union(out.index)).ffill().reindex(out.index)
 
     if fill_gaps:
         out["close"] = out["close"].ffill()
