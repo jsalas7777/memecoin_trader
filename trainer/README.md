@@ -8,7 +8,8 @@ Implemented so far:
 2. `build_dataset.py`: turn it into an ML dataset of **30-second candles** with holder counts,
    engineered features and future-return targets. Every input is described in [DATASET.md](DATASET.md).
 3. `build_sequences.py`: tokenized model inputs. For each moment, the last **120 candles** become
-   120 candle tokens, 120 volume tokens and 120 holder tokens. The spec is in [MODEL.md](MODEL.md).
+   120 tokens each of candle, volume, holders, top-10 concentration, trades per minute and
+   liquidity. The spec is in [MODEL.md](MODEL.md).
 
 ## Setup
 
@@ -26,8 +27,11 @@ export SOLANA_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
 
 ```bash
 # 1. Discover memecoins on-chain -> data/tokens.csv
-python download_data.py discover --mode new --limit 50        # newest pump.fun launches
-python download_data.py discover --mode active --limit 25     # most-traded on pump.fun / PumpSwap now
+# RECOMMENDED for training: launches sampled evenly over a past window. This keeps the real
+# mix (most coins die), so the model learns what to avoid, not only what pumps.
+python download_data.py discover --mode new --limit 500 --min-age 6h --max-age 2d
+python download_data.py discover --mode new --limit 50        # latest launches that are >= 2h old
+python download_data.py discover --mode active --limit 25     # hot right now (survivors only: biased)
 
 # 2. Download swap history + OHLCV for every mint in data/tokens.csv
 python download_data.py history --max-signatures 20000          # 30s candles by default
@@ -44,8 +48,12 @@ python download_data.py ohlcv --intervals 15s,1min,15min
 # 3. Build the ML dataset -> data/dataset/dataset_30s.csv + DATASET.md
 python build_dataset.py --interval 30s --horizons 1min,5min,10min --up-threshold 0.10
 
-# 4. Tokenize into 3 x 120-token model inputs -> data/dataset/sequences_30s.npz + MODEL.md
+# 4. Tokenize into 6 x 120-token model inputs -> data/dataset/sequences_30s.npz + MODEL.md
+#    (runs the input verification automatically and fails if any input is wrong)
 python build_sequences.py
+
+# Re-check the model inputs at any time
+python check_inputs.py
 ```
 
 Re-running `history` is **incremental**. It fetches transactions that are newer than the last run
@@ -64,7 +72,7 @@ data/
   ohlcv/<interval>/<mint>.csv   candles
   state/<mint>.json             pagination cursors + token metadata
   dataset/dataset_30s.csv       ML dataset (features + targets), see DATASET.md
-  dataset/sequences_30s.npz     tokenized 3 x 120 model inputs + targets, see MODEL.md
+  dataset/sequences_30s.npz     tokenized 6 x 120 model inputs + targets, see MODEL.md
 ```
 
 **trades/<mint>.csv**: `signature, slot, tx_index, block_time, datetime, dex, pool_vault, side (buy|sell),
@@ -96,6 +104,16 @@ filled with volume 0 and the previous close, so the series is evenly spaced for 
 5. **OHLCV** (`solana_data/ohlcv.py`): trades are resampled into candles with pandas.
 6. **Dataset** (`dataset/features.py`, `build_dataset.py`): features use only past data, targets use
    only future data, and train/val/test are split by token.
+
+## Dead coins
+
+The dataset deliberately includes coins that die. Most pump.fun launches do.
+- `--mode new --min-age 6h --max-age 2d` samples launches evenly in time, whatever their outcome.
+- `build_dataset.py` keeps any coin with at least 3 trades. After a coin's last trade, its series
+  continues with empty candles, so the minutes before it died get real labels.
+- `target_dump_*` (price -30% within the horizon) is the avoid/exit label. `outcome_dead`,
+  `outcome_graduated`, `outcome_ath_mcap_sol`, etc. record each coin's fate. They are for
+  evaluation only, never inputs.
 
 ## Notes / limitations
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import Counter
 
 from .constants import DEX_PROGRAMS, NON_MEME_MINTS, PUMP_FUN_MINT_AUTHORITY
@@ -35,10 +36,61 @@ async def _fetch_all(rpc: SolanaRPC, signatures: list[str]) -> list[dict]:
     return out
 
 
-async def discover_new_pumpfun(rpc: SolanaRPC, limit: int = 50) -> list[dict]:
-    """Newest pump.fun launches, found via the pump.fun mint authority's history."""
-    sigs = await _signatures(rpc, PUMP_FUN_MINT_AUTHORITY, limit)
-    log.info("scanning %d pump.fun creation txs", len(sigs))
+async def _signatures_in_window(rpc: SolanaRPC, address: str, newest_ts: int, oldest_ts: int,
+                                max_scan: int) -> list[dict]:
+    """All successful signatures of `address` with oldest_ts <= blockTime <= newest_ts."""
+    out: list[dict] = []
+    before, scanned = None, 0
+    while scanned < max_scan:
+        page = await rpc.get_signatures_for_address(address, before=before, limit=1000)
+        if not page:
+            break
+        scanned += len(page)
+        for s in page:
+            t = s.get("blockTime") or 0
+            if t > newest_ts or s.get("err") is not None:
+                continue
+            if t < oldest_ts:
+                return out
+            out.append(s)
+        before = page[-1]["signature"]
+        if scanned % 10000 < 1000:
+            log.info("  scanned %d launch signatures back to %s", scanned,
+                     time.strftime("%Y-%m-%d %H:%M", time.gmtime(page[-1].get("blockTime") or 0)))
+    return out
+
+
+async def discover_new_pumpfun(rpc: SolanaRPC, limit: int = 50, min_age_s: int = 0,
+                               max_age_s: int | None = None, max_scan: int = 500_000) -> list[dict]:
+    """pump.fun launches, read from the pump.fun mint authority's on-chain history.
+
+    min_age_s: only coins launched at least this long ago, so their fate (pumped or died)
+               is already known. Fresh launches have no outcome yet.
+    max_age_s: if set, `limit` launches are sampled evenly across the whole window
+               [now - max_age, now - min_age] instead of taking consecutive ones. This keeps
+               the natural mix of coins (the large majority die), with no survivorship bias.
+    """
+    now = int(time.time())
+    newest_ts = now - min_age_s
+    oldest_ts = now - max_age_s if max_age_s else 0
+    if max_age_s:
+        window = await _signatures_in_window(rpc, PUMP_FUN_MINT_AUTHORITY, newest_ts, oldest_ts, max_scan)
+        log.info("%d launches in window; sampling %d evenly", len(window), min(limit, len(window)))
+        if len(window) > limit:
+            idx = sorted({round(i * (len(window) - 1) / max(limit - 1, 1)) for i in range(limit)})
+            window = [window[i] for i in idx]
+        sigs = window
+    else:
+        sigs = []
+        before = None
+        while len(sigs) < limit:
+            page = await rpc.get_signatures_for_address(PUMP_FUN_MINT_AUTHORITY, before=before, limit=1000)
+            if not page:
+                break
+            sigs.extend(s for s in page if s.get("err") is None and (s.get("blockTime") or 0) <= newest_ts)
+            before = page[-1]["signature"]
+        sigs = sigs[:limit]
+    log.info("fetching %d pump.fun creation txs", len(sigs))
     tokens = []
     for tx in await _fetch_all(rpc, [s["signature"] for s in sigs]):
         meta = tx["meta"]

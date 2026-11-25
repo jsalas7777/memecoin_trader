@@ -23,12 +23,22 @@ FEATURES: dict[str, tuple[str, str]] = {
     "buys": ("Number of buy swaps", "count"),
     "sells": ("Number of sell swaps", "count"),
     "unique_traders": ("Distinct wallets that traded in the candle", "count"),
-    "sol_reserve": ("SOL liquidity in the pool at candle close", "SOL"),
-    "token_reserve": ("Token liquidity in the pool at candle close", "tokens"),
+    "token_reserve": ("Tokens in the most recently traded pool at candle close", "tokens"),
     "market_cap_sol": ("close x total supply", "SOL"),
     "holders": ("Wallets holding > 0 tokens at candle close (rebuilt from on-chain balances)", "count"),
+    # --- liquidity ---
+    "liquidity_sol": ("Total SOL in all of the coin's pools at candle close (bonding curve + AMMs)", "SOL"),
+    "liquidity_change_1": ("liquidity_sol / liquidity_sol 1 candle ago - 1", "ratio"),
+    "liquidity_change_10": ("liquidity_sol / liquidity_sol 10 candles ago - 1 (a sharp drop = liquidity pulled)", "ratio"),
+    "liquidity_to_mcap": ("liquidity_sol / market_cap_sol (how thin the market is)", "ratio"),
+    # --- activity ---
+    "trades_per_min": ("Swaps in the last 60 seconds", "trades/min"),
+    "trades_per_min_5m": ("Average swaps per minute over the last 5 minutes", "trades/min"),
+    # --- concentration ---
+    "top10_pct": ("% of total supply held by the 10 largest wallets (pools and program accounts excluded)", "%"),
+    "top10_change_10": ("top10_pct - top10_pct 10 candles ago (negative = big holders selling)", "% points"),
     # --- lifecycle ---
-    "age_s": ("Seconds since the token's first downloaded trade", "s"),
+    "age_s": ("Seconds since the coin was launched (or since its first downloaded trade if the launch time is unknown)", "s"),
     "candles_since_trade": ("Consecutive candles with no trades up to now (0 = traded this candle)", "count"),
     # --- returns / momentum ---
     "ret_1": ("Log return of close over 1 candle", "log"),
@@ -61,7 +71,6 @@ FEATURES: dict[str, tuple[str, str]] = {
     "holders_change_1": ("holders - holders 1 candle ago", "count"),
     "holders_change_10": ("holders - holders 10 candles ago", "count"),
     "holders_growth_10": ("holders / holders 10 candles ago - 1", "ratio"),
-    "sol_reserve_change_10": ("sol_reserve / sol_reserve 10 candles ago - 1", "ratio"),
     "log_market_cap": ("log(1 + market_cap_sol)", "log SOL"),
 }
 
@@ -69,11 +78,21 @@ ID_COLUMNS: dict[str, str] = {
     "mint": "Token mint address",
     "symbol": "Token symbol (from on-chain metadata)",
     "timestamp": "Candle open time, UTC",
+    "segment": "Contiguous stretch of downloaded data within the coin (0, 1, ...). Windows never cross segments",
     "split": "train / val / test, assigned per token (all rows of a token share a split)",
 }
 
 
-def target_docs(horizons: dict[str, int], up_threshold: float) -> dict[str, str]:
+OUTCOME_COLUMNS: dict[str, str] = {
+    "outcome_dead": "1 if the coin is dead at download time (no trade for 1h, or price 90%+ below its all-time high)",
+    "outcome_graduated": "1 if the coin left the pump.fun bonding curve and traded on an AMM (e.g. PumpSwap)",
+    "outcome_ath_mcap_sol": "Highest market cap the coin ever reached",
+    "outcome_final_drawdown": "Last price / all-time-high price - 1 (-0.99 = lost 99% from its peak)",
+    "outcome_lifetime_s": "Seconds between the first and last trade",
+}
+
+
+def target_docs(horizons: dict[str, int], up_threshold: float, dump_threshold: float = 0.3) -> dict[str, str]:
     docs = {}
     for name, h in horizons.items():
         docs[f"target_ret_{name}"] = f"Log return from close[t] to close[t+{h}] ({name} ahead)"
@@ -81,6 +100,8 @@ def target_docs(horizons: dict[str, int], up_threshold: float) -> dict[str, str]
         docs[f"target_min_ret_{name}"] = f"Worst case: min(low[t+1..t+{h}]) / close[t] - 1"
         docs[f"target_up_{name}"] = (f"1 if target_ret_{name} > log(1 + {up_threshold:g}) "
                                      f"(price up more than {up_threshold:.0%}), else 0")
+        docs[f"target_dump_{name}"] = (f"1 if the price drops more than {dump_threshold:.0%} below close[t] at any "
+                                       f"point in the next {name} (low[t+1..t+{h}]), else 0")
     return docs
 
 
@@ -96,13 +117,14 @@ def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     return (100 - 100 / (1 + rs)).where(loss > 0, 100.0).where(gain.notna())
 
 
-def make_features(c: pd.DataFrame) -> pd.DataFrame:
-    """c: candles of ONE token from build_ohlcv (gap-filled, sorted by time)."""
+def make_features(c: pd.DataFrame, t0: pd.Timestamp | None = None) -> pd.DataFrame:
+    """c: ONE contiguous segment of one coin's candles (gap-filled, sorted by time).
+    t0: the coin's launch time (for age_s); defaults to the first candle."""
     f = c.copy()
     close, high, low, open_ = f["close"], f["high"], f["low"], f["open"]
     lr = np.log(close).diff()
 
-    f["age_s"] = (f["timestamp"] - f["timestamp"].iloc[0]).dt.total_seconds()
+    f["age_s"] = (f["timestamp"] - (t0 if t0 is not None else f["timestamp"].iloc[0])).dt.total_seconds()
     idle = (f["trades"] == 0).astype(int)
     f["candles_since_trade"] = idle.groupby((idle == 0).cumsum()).cumsum()
 
@@ -136,12 +158,24 @@ def make_features(c: pd.DataFrame) -> pd.DataFrame:
     f["holders_change_1"] = h.diff(1)
     f["holders_change_10"] = h.diff(10)
     f["holders_growth_10"] = _safe_div(h, h.shift(10)) - 1
-    f["sol_reserve_change_10"] = _safe_div(f["sol_reserve"], f["sol_reserve"].shift(10)) - 1
+    liq = f["liquidity_sol"]
+    f["liquidity_change_1"] = _safe_div(liq, liq.shift(1)) - 1
+    f["liquidity_change_10"] = _safe_div(liq, liq.shift(10)) - 1
+    f["liquidity_to_mcap"] = _safe_div(liq, f["market_cap_sol"])
+
+    step_s = (f["timestamp"].iloc[1] - f["timestamp"].iloc[0]).total_seconds() if len(f) > 1 else 60.0
+    n1 = max(1, round(60 / step_s))
+    n5 = max(1, round(300 / step_s))
+    f["trades_per_min"] = f["trades"].rolling(n1, min_periods=1).sum() * 60 / (n1 * step_s)
+    f["trades_per_min_5m"] = f["trades"].rolling(n5, min_periods=1).sum() * 60 / (n5 * step_s)
+
+    f["top10_change_10"] = f["top10_pct"].diff(10)
     f["log_market_cap"] = np.log1p(f["market_cap_sol"])
     return f.replace([np.inf, -np.inf], np.nan)
 
 
-def make_targets(f: pd.DataFrame, horizons: dict[str, int], up_threshold: float) -> pd.DataFrame:
+def make_targets(f: pd.DataFrame, horizons: dict[str, int], up_threshold: float,
+                 dump_threshold: float = 0.3) -> pd.DataFrame:
     close = f["close"]
     for name, h in horizons.items():
         fut_close = close.shift(-h)
@@ -153,4 +187,6 @@ def make_targets(f: pd.DataFrame, horizons: dict[str, int], up_threshold: float)
         f[f"target_max_ret_{name}"] = fut_high / close - 1
         f[f"target_min_ret_{name}"] = fut_low / close - 1
         f[f"target_up_{name}"] = (ret > np.log1p(up_threshold)).astype("Int8").where(ret.notna())
+        worst = f[f"target_min_ret_{name}"]
+        f[f"target_dump_{name}"] = (worst < -dump_threshold).astype("Int8").where(worst.notna())
     return f

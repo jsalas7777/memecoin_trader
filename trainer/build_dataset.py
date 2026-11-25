@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from dataset.features import FEATURES, ID_COLUMNS, make_features, make_targets, target_docs
+from dataset.features import FEATURES, ID_COLUMNS, OUTCOME_COLUMNS, make_features, make_targets, target_docs
 from solana_data.ohlcv import build_ohlcv
 
 log = logging.getLogger("dataset")
@@ -46,10 +46,74 @@ def parse_horizons(spec: str, interval: str) -> dict[str, int]:
     return out
 
 
+def uncovered_intervals(trades: pd.DataFrame, state: dict) -> list[tuple[int, int]]:
+    """Time ranges (unix s) where a pool existed but its transactions were NOT downloaded.
+
+    A capped download fetches the newest N transactions of each pool. For a pool whose history
+    is incomplete, the time between when it started existing and its earliest fetched trade is
+    unknown. For an AMM pool of a pump.fun coin, "started existing" = graduation = the last
+    bonding-curve trade. Filling such a gap with empty candles would look like a dead coin, so
+    those candles are dropped instead.
+    """
+    t = trades.dropna(subset=["block_time"])
+    if t.empty:
+        return []
+    first_by_pool = t.groupby("pool_vault")["block_time"].min()
+    curve = t[t["dex"] == "pumpfun"]
+    curve_last = curve["block_time"].max() if len(curve) else None
+    out = []
+    for vault, ps in (state.get("pools") or {}).items():
+        if ps.get("complete") or vault not in first_by_pool.index:
+            continue
+        start = curve_last if ps.get("dex") != "pumpfun" and curve_last is not None else t["block_time"].min()
+        end = first_by_pool[vault]
+        if end > start:
+            out.append((int(start), int(end)))
+    return out
+
+
+def split_segments(candles: pd.DataFrame, gaps: list[tuple[int, int]], interval: str) -> pd.DataFrame:
+    """Drop candles inside coverage gaps and number the remaining contiguous stretches."""
+    c = candles.copy()
+    step = pd.Timedelta(interval)
+    drop = pd.Series(False, index=c.index)
+    for a, b in gaps:
+        lo = pd.to_datetime(a, unit="s", utc=True).floor(interval)
+        hi = pd.to_datetime(b, unit="s", utc=True).floor(interval)
+        drop |= (c["timestamp"] > lo) & (c["timestamp"] < hi)
+    c = c[~drop].reset_index(drop=True)
+    c["segment"] = (c["timestamp"].diff() != step).cumsum() - 1
+    return c
+
+
+def coin_outcomes(trades: pd.DataFrame, supply: float | None, observed_until: int | None) -> dict:
+    sol = trades[trades["quote"] == "SOL"].sort_values(["slot", "tx_index"], na_position="last")
+    if sol.empty:
+        return {k: float("nan") for k in OUTCOME_COLUMNS}
+    ath, last = sol["price"].max(), sol["price"].iloc[-1]
+    first_t, last_t = sol["block_time"].min(), sol["block_time"].max()
+    idle = (observed_until or last_t) - last_t
+    drawdown = last / ath - 1
+    return {
+        "outcome_dead": int(idle > 3600 or drawdown < -0.9),
+        "outcome_graduated": int((sol["dex"] != "pumpfun").any()),
+        "outcome_ath_mcap_sol": ath * supply if supply else float("nan"),
+        "outcome_final_drawdown": drawdown,
+        "outcome_lifetime_s": last_t - first_t,
+    }
+
+
 def build(args) -> tuple[pd.DataFrame, dict]:
     data = Path(args.data_dir)
     horizons = parse_horizons(args.horizons, args.interval)
-    frames, skipped = [], []
+    max_h = pd.Timedelta(args.interval) * max(horizons.values())
+    frames, skipped, coins = [], [], []
+    catalog_path = data / "tokens.csv"
+    created = {}
+    if catalog_path.exists():
+        cat = pd.read_csv(catalog_path)
+        if "created_at" in cat.columns:
+            created = dict(zip(cat["mint"], cat["created_at"]))
     for trades_path in sorted((data / "trades").glob("*.csv")):
         mint = trades_path.stem
         trades = pd.read_csv(trades_path)
@@ -61,31 +125,61 @@ def build(args) -> tuple[pd.DataFrame, dict]:
         bal_path = data / "balances" / f"{mint}.csv"
         balances = pd.read_csv(bal_path) if bal_path.exists() else None
 
-        candles = build_ohlcv(trades, args.interval, supply=state.get("supply"), balances=balances)
-        if len(candles) <= max(horizons.values()):
-            skipped.append((mint, f"only {len(candles)} candles"))
+        # The download fetched every trade up to `updated_at`. If the coin stopped trading
+        # before that, the empty candles after its last trade are real ("it died"), so the
+        # series is extended far enough that every real candle gets complete targets.
+        observed = state.get("updated_at")
+        end_time = None
+        if observed:
+            last_trade = pd.to_datetime(trades["block_time"].max(), unit="s", utc=True)
+            end_time = min(pd.to_datetime(observed, unit="s", utc=True), last_trade + max_h)
+        candles = build_ohlcv(trades, args.interval, supply=state.get("supply"), balances=balances,
+                              end_time=end_time)
+        gaps = uncovered_intervals(trades, state)
+        candles = split_segments(candles, gaps, args.interval)
+        if candles.empty:
+            skipped.append((mint, "no candles"))
             continue
-        f = make_targets(make_features(candles), horizons, args.up_threshold)
+        t0 = pd.to_datetime(created[mint], unit="s", utc=True) if pd.notna(created.get(mint)) else \
+            pd.to_datetime(trades["block_time"].min(), unit="s", utc=True)
+        parts = []
+        for _, seg in candles.groupby("segment", sort=True):
+            seg = seg.reset_index(drop=True)
+            parts.append(make_targets(make_features(seg, t0), horizons, args.up_threshold, args.dump_threshold))
+        f = pd.concat(parts, ignore_index=True)
+        if gaps:
+            log.info("  %s: %d coverage gap(s) removed (history not fully downloaded), %d segment(s)",
+                     state.get("symbol") or mint[:8], len(gaps), f["segment"].nunique())
         f.insert(0, "mint", mint)
         f.insert(1, "symbol", state.get("symbol") or "")
         f["split"] = assign_split(mint, args.val, args.test)
+        outcome = coin_outcomes(trades, state.get("supply"), observed)
+        for k, v in outcome.items():
+            f[k] = v
+        coins.append({"mint": mint, "symbol": state.get("symbol") or "", "trades": len(trades), **outcome})
         frames.append(f)
         log.info("%-10s %6d candles  %6d trades  holders=%s", (state.get("symbol") or mint[:8])[:10],
                  len(f), len(trades), int(f["holders"].iloc[-1]) if f["holders"].notna().any() else "n/a")
 
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    target_cols = [c for c in df.columns if c.startswith("target_")]
+    if not df.empty and not args.keep_incomplete:
+        # rows whose future is not (yet) known -> unusable for training
+        before = df.groupby("mint").size()
+        df = df.dropna(subset=[f"target_ret_{max(horizons, key=horizons.get)}"])
+        for mint in sorted(set(before.index) - set(df["mint"])):
+            skipped.append((mint, f"{before[mint]} candles, none with a known {max(horizons, key=horizons.get)} future"))
+    if df.empty:
+        if args.out_path.exists():
+            args.out_path.unlink()  # never leave a stale dataset behind for build_sequences
+        for mint, why in skipped:
+            log.info("skipped %s (%s)", mint, why)
+        raise SystemExit("no coin has enough data; download more (deeper --max-signatures or older coins)")
     for mint, why in skipped:
         log.info("skipped %s (%s)", mint, why)
-    if not frames:
-        raise SystemExit("no tokens with enough data; download more with download_data.py")
-
-    df = pd.concat(frames, ignore_index=True)
-    target_cols = [c for c in df.columns if c.startswith("target_")]
-    if not args.keep_incomplete:
-        # rows at the end of each series have no future yet -> unusable for training
-        df = df.dropna(subset=[f"target_ret_{max(horizons, key=horizons.get)}"])
-    cols = list(ID_COLUMNS) + list(FEATURES) + target_cols
+    cols = list(ID_COLUMNS) + list(FEATURES) + target_cols + list(OUTCOME_COLUMNS)
     df = df[cols]
-    meta = {"horizons": horizons, "skipped": skipped, "target_cols": target_cols}
+    meta = {"horizons": horizons, "skipped": skipped, "target_cols": target_cols, "coins": pd.DataFrame(coins)}
     return df, meta
 
 
@@ -98,7 +192,8 @@ def fmt(x) -> str:
 
 
 def write_markdown(args, df: pd.DataFrame, meta: dict, out_csv: Path) -> None:
-    tdocs = target_docs(meta["horizons"], args.up_threshold)
+    tdocs = target_docs(meta["horizons"], args.up_threshold, args.dump_threshold)
+    coins = meta["coins"]
     L = []
     L.append("# Memecoin dataset\n")
     L.append(f"Generated {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC} by `build_dataset.py` "
@@ -115,9 +210,12 @@ def write_markdown(args, df: pd.DataFrame, meta: dict, out_csv: Path) -> None:
         L.append(f"| {split} | {row['nunique']} tokens, {row['size']:,} rows |")
     L.append(f"| Input features | {len(FEATURES)} |")
     L.append(f"| Targets | {len(meta['target_cols'])} |")
-    if meta["target_cols"]:
-        up = [c for c in meta["target_cols"] if c.startswith("target_up_")]
-        for c in up:
+    if len(coins):
+        dead = int(coins["outcome_dead"].sum())
+        L.append(f"| Coins dead at download | **{dead} of {len(coins)} ({dead / len(coins):.0%})** |")
+        L.append(f"| Coins that graduated | {int(coins['outcome_graduated'].sum())} of {len(coins)} |")
+    for c in meta["target_cols"]:
+        if c.startswith(("target_up_", "target_dump_")):
             L.append(f"| `{c}` positive rate | {df[c].mean():.1%} |")
     L.append("")
     L.append("One row = one token x one candle. Rows are sorted by token, then time.\n")
@@ -146,6 +244,24 @@ def write_markdown(args, df: pd.DataFrame, meta: dict, out_csv: Path) -> None:
         L.append(f"| `{k}` | {tdocs.get(k, '')} | {s.notna().mean():.0%} | {fmt(s.mean())} |")
     L.append("")
 
+    L.append("## Coin outcomes (labels, not inputs)\n")
+    L.append("One value per coin, repeated on every row of that coin. These describe the coin's whole "
+             "future, so **never use them as model inputs**. Use them to weight, filter or evaluate "
+             "(for example, how often the model buys coins that end up dead).\n")
+    L.append("| Column | Description |\n|---|---|")
+    for k, v in OUTCOME_COLUMNS.items():
+        L.append(f"| `{k}` | {v} |")
+    L.append("")
+    if len(coins):
+        L.append("<details><summary>Per-coin outcomes in this build</summary>\n")
+        L.append("| symbol | mint | trades | dead | graduated | ATH mcap (SOL) | final drawdown | lifetime |")
+        L.append("|---|---|---|---|---|---|---|---|")
+        for _, r in coins.sort_values("outcome_ath_mcap_sol", ascending=False).iterrows():
+            L.append(f"| {r['symbol']} | `{r['mint'][:8]}…` | {r['trades']} | {fmt(r['outcome_dead'])} | "
+                     f"{fmt(r['outcome_graduated'])} | {fmt(r['outcome_ath_mcap_sol'])} | "
+                     f"{r['outcome_final_drawdown']:.0%} | {fmt(r['outcome_lifetime_s'] / 60)} min |")
+        L.append("\n</details>\n")
+
     L.append("## How the inputs are produced\n")
     L.append("""- **Prices and volume** come from every swap that touched the token's pools (pump.fun bonding
   curve, PumpSwap, Raydium, Meteora, ...). Price = SOL moved / tokens moved in each swap,
@@ -158,16 +274,25 @@ def write_markdown(args, df: pd.DataFrame, meta: dict, out_csv: Path) -> None:
   tokens by plain transfer and never traded through a pool are not seen, so this is a slight
   undercount. The exact current count from chain is in `data/tokens.csv` (`holders_now`).
 - **Market cap** = close x current total supply.
+- **Gaps in the download are not faked.** If a pool's history wasn't fully downloaded (capped by
+  `--max-signatures`), the unknown time between the pool appearing and its earliest fetched
+  trade is removed, instead of being filled with empty candles that would look like a dead coin.
+  The rest of the coin is kept as separate `segment`s, and features, targets and model windows
+  never cross a segment boundary. Download deeper (`--max-signatures`) to close the gaps.
+- **Dead coins are kept.** Coins are not filtered by success, and every coin with at least
+  """ + str(args.min_trades) + """ trades is included. After a coin's last trade, the series continues with empty
+  `NO_TRADE` candles up to the download time (capped at the longest horizon). So the
+  minutes before a coin dies get real targets: the model sees "this pattern -> nothing / dump".
 - **Split**: each token goes entirely into train, val or test (by a hash of its mint), so the
   model is always tested on coins it has never seen.
 """)
     L.append("## Regenerate\n")
-    L.append("```bash\npython download_data.py run --mode active --limit 50 --max-signatures 20000\n"
+    L.append("```bash\npython download_data.py run --mode new --limit 500 --min-age 6h --max-age 2d --max-signatures 20000\n"
              f"python build_dataset.py --interval {args.interval} --horizons {args.horizons} "
              f"--up-threshold {args.up_threshold:g}\n```\n")
     if meta["skipped"]:
         L.append("## Skipped tokens\n")
-        L.append(f"Tokens with fewer than {args.min_trades} trades, or too few candles for the longest horizon:\n")
+        L.append(f"Coins with fewer than {args.min_trades} trades, or with no candle whose future is known yet:\n")
         for mint, why in meta["skipped"]:
             L.append(f"- `{mint}`: {why}")
         L.append("")
@@ -182,7 +307,10 @@ def main() -> None:
     p.add_argument("--horizons", default="1min,5min,10min", help="target horizons, multiples of interval")
     p.add_argument("--up-threshold", type=float, default=0.10,
                    help="price rise that counts as 'up' for target_up_* (default 0.10 = +10%%)")
-    p.add_argument("--min-trades", type=int, default=20, help="skip tokens with fewer trades")
+    p.add_argument("--dump-threshold", type=float, default=0.30,
+                   help="price drop that counts as a dump for target_dump_* (default 0.30 = -30%%)")
+    p.add_argument("--min-trades", type=int, default=3,
+                   help="skip coins with fewer trades (default 3; keep low so dead coins stay in)")
     p.add_argument("--val", type=float, default=0.15, help="fraction of tokens for validation")
     p.add_argument("--test", type=float, default=0.15, help="fraction of tokens for test")
     p.add_argument("--keep-incomplete", action="store_true",
@@ -192,8 +320,9 @@ def main() -> None:
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
-    df, meta = build(args)
     out = Path(args.out) if args.out else Path(args.data_dir) / "dataset" / f"dataset_{args.interval}.csv"
+    args.out_path = out
+    df, meta = build(args)
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
     log.info("dataset: %d rows, %d tokens, %d features, %d targets -> %s", len(df), df["mint"].nunique(),

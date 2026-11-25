@@ -2,10 +2,14 @@
 """Download Solana memecoin price / volume history directly from the chain.
 
 Examples:
-  # find the 30 newest pump.fun launches and save them to data/tokens.csv
+  # RECOMMENDED for training: 500 launches spread evenly over a past window.
+  # Includes the coins that died (most of them), not just the winners.
+  python download_data.py run --mode new --limit 500 --min-age 6h --max-age 2d
+
+  # the 30 latest pump.fun launches that are at least 2h old
   python download_data.py discover --mode new --limit 30
 
-  # find currently hot tokens trading on pump.fun / PumpSwap
+  # currently hot tokens (survivors only -> biased, don't train on these alone)
   python download_data.py discover --mode active --limit 20
 
   # download swap history + OHLCV for every token in data/tokens.csv
@@ -43,6 +47,16 @@ log = logging.getLogger("download")
 HERE = Path(__file__).resolve().parent
 
 
+def parse_duration(value: str | None) -> int | None:
+    """'30m', '6h', '2d' -> seconds."""
+    if not value:
+        return None
+    units = {"m": 60, "h": 3600, "d": 86400}
+    if value[-1] not in units:
+        sys.exit(f"bad duration {value!r}; use e.g. 30m, 6h, 2d")
+    return int(float(value[:-1]) * units[value[-1]])
+
+
 def parse_since(value: str | None) -> int | None:
     if not value:
         return None
@@ -73,7 +87,11 @@ def save_tokens(args, tokens: list[dict]) -> pd.DataFrame:
 
 async def cmd_discover(args, rpc: SolanaRPC) -> list[str]:
     if args.mode == "new":
-        tokens = await discover_new_pumpfun(rpc, args.limit)
+        min_age = parse_duration(args.min_age) or 0
+        max_age = parse_duration(args.max_age)
+        if max_age is not None and max_age <= min_age:
+            sys.exit("--max-age must be larger than --min-age")
+        tokens = await discover_new_pumpfun(rpc, args.limit, min_age, max_age)
     else:
         tokens = await discover_active(rpc, args.programs.split(","), args.sample_txs, args.limit)
     log.info("discovered %d tokens", len(tokens))
@@ -164,7 +182,13 @@ def main() -> None:
     def add_discover(sp):
         sp.add_argument("--mode", choices=["new", "active"], default="new",
                         help="new = latest pump.fun launches; active = most traded right now")
-        sp.add_argument("--limit", type=int, default=25)
+        sp.add_argument("--limit", type=int, default=25, help="number of coins")
+        sp.add_argument("--min-age", default="2h",
+                        help="new mode: only coins launched at least this long ago, so their outcome "
+                             "(pumped / died) is known (default 2h; 0m for the very latest)")
+        sp.add_argument("--max-age",
+                        help="new mode: sample --limit launches evenly across [max-age, min-age] ago, "
+                             "e.g. --min-age 6h --max-age 2d (unbiased mix of dead and successful coins)")
         sp.add_argument("--programs", default="pumpfun,pumpswap",
                         help="active mode: DEX programs to scan (pumpfun,pumpswap,raydium_v4,"
                              "raydium_cpmm,raydium_launchlab,meteora_dlmm or a program id)")

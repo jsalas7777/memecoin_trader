@@ -1,9 +1,12 @@
 """Convert 30s candles into discrete tokens for a sequence model.
 
-Each candle produces three tokens, one per input stream:
-  candle  : price move vs the previous close x candle range (shape of the bar)
-  volume  : SOL volume on a log scale
-  holders : number of holders on a log scale (5% steps)
+Each candle produces one token per input stream:
+  candle    : price move vs the previous close x candle range (shape of the bar)
+  volume    : SOL volume on a log scale
+  holders   : number of holders on a log scale (5% steps)
+  top10     : % of supply held by the 10 largest wallets (2.5% steps)
+  trades    : trades per minute (exact up to 10, then 25% steps)
+  liquidity : total SOL in the coin's pools on a log scale (~26% steps)
 
 Id 0 is always PAD (left padding for tokens with < 120 candles of history).
 """
@@ -46,6 +49,29 @@ HOLDERS_OFFSET = 3
 HOLDERS_VOCAB = HOLDERS_OFFSET + HOLDERS_EXACT + HOLDERS_LOG_BINS  # 263
 
 
+# ---- top-10 concentration stream ------------------------------------------------
+TOP10_UNKNOWN = 1
+TOP10_STEP_PCT = 2.5
+TOP10_BINS = int(100 / TOP10_STEP_PCT)  # 40
+TOP10_OFFSET = 2
+TOP10_VOCAB = TOP10_OFFSET + TOP10_BINS  # 42
+
+# ---- trades-per-minute stream --------------------------------------------------
+TRADES_ZERO = 1
+TRADES_EXACT = 10        # 1..10 trades/min each get their own token
+TRADES_STEP = 1.25       # above 10, each bin is 25% more trades/min
+TRADES_LOG_BINS = 36     # 10 * 1.25^36 ~ 30k trades/min
+TRADES_OFFSET = 2
+TRADES_VOCAB = TRADES_OFFSET + TRADES_EXACT + TRADES_LOG_BINS  # 48
+
+# ---- liquidity stream ----------------------------------------------------------
+LIQ_UNKNOWN = 1
+LIQ_LOG10_MIN, LIQ_LOG10_MAX, LIQ_STEP = -2.0, 5.0, 0.1   # 0.01 SOL .. 100k SOL
+LIQ_EDGES = np.round(np.arange(LIQ_LOG10_MIN, LIQ_LOG10_MAX + 1e-9, LIQ_STEP), 6)  # 71 edges -> 72 bins
+LIQ_OFFSET = 2
+LIQ_VOCAB = LIQ_OFFSET + len(LIQ_EDGES) + 1  # 74
+
+
 def _ret_bin(ret_pct: np.ndarray) -> np.ndarray:
     """Signed % move -> 0..20 (10 = flat)."""
     mag = np.searchsorted(RET_EDGES_PCT, np.abs(ret_pct), side="right")  # 0..10
@@ -84,6 +110,30 @@ def holder_tokens(c: pd.DataFrame) -> np.ndarray:
     tok = HOLDERS_OFFSET + _holders_bin(h)
     tok = np.where(h == 0, HOLDERS_ZERO, tok)
     return np.where(np.isnan(h), HOLDERS_UNKNOWN, tok).astype(np.int16)
+
+
+def top10_tokens(c: pd.DataFrame) -> np.ndarray:
+    pct = c["top10_pct"].to_numpy(float)
+    b = np.clip(np.floor(np.nan_to_num(pct) / TOP10_STEP_PCT), 0, TOP10_BINS - 1).astype(int)
+    return np.where(np.isnan(pct), TOP10_UNKNOWN, TOP10_OFFSET + b).astype(np.int16)
+
+
+def trades_tokens(c: pd.DataFrame) -> np.ndarray:
+    tpm = np.round(c["trades_per_min"].to_numpy(float), 6)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        geo = TRADES_EXACT + np.floor(np.log(np.maximum(tpm, 1) / (TRADES_EXACT + 1)) / math.log(TRADES_STEP))
+    exact = np.ceil(tpm) - 1  # (0,1] -> 0, (1,2] -> 1, ... (9,10] -> 9
+    b = np.where(tpm <= TRADES_EXACT, exact, np.maximum(geo, TRADES_EXACT))
+    b = np.clip(np.nan_to_num(b), 0, TRADES_EXACT + TRADES_LOG_BINS - 1).astype(int)
+    return np.where(np.nan_to_num(tpm) > 0, TRADES_OFFSET + b, TRADES_ZERO).astype(np.int16)
+
+
+def liquidity_tokens(c: pd.DataFrame) -> np.ndarray:
+    liq = c["liquidity_sol"].to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lv = np.log10(np.where(liq > 0, liq, np.nan))
+    b = np.searchsorted(LIQ_EDGES, np.nan_to_num(lv, nan=-99), side="right")
+    return np.where(np.isnan(liq), LIQ_UNKNOWN, LIQ_OFFSET + b).astype(np.int16)
 
 
 def windows(tokens: np.ndarray, ends: np.ndarray, seq_len: int = SEQ_LEN) -> np.ndarray:
@@ -145,4 +195,40 @@ def holders_vocab() -> list[tuple[int, str]]:
             out.append((HOLDERS_OFFSET + b, f"{lo:,} or more holders"))
         elif hi >= lo:
             out.append((HOLDERS_OFFSET + b, f"{lo:,} holders" if lo == hi else f"{lo:,} - {hi:,} holders"))
+    return out
+
+
+def top10_vocab() -> list[tuple[int, str]]:
+    out = [(PAD, "PAD"), (TOP10_UNKNOWN, "UNKNOWN (no balance data)")]
+    for b in range(TOP10_BINS):
+        lo, hi = b * TOP10_STEP_PCT, (b + 1) * TOP10_STEP_PCT
+        out.append((TOP10_OFFSET + b, f"top 10 hold {lo:g}% - {hi:g}%" + (" (or more)" if b == TOP10_BINS - 1 else "")))
+    return out
+
+
+def trades_vocab() -> list[tuple[int, str]]:
+    out = [(PAD, "PAD"), (TRADES_ZERO, "ZERO (no trades in the last minute)")]
+    for k in range(1, TRADES_EXACT + 1):
+        out.append((TRADES_OFFSET + k - 1, f"{k} trade{'s' if k > 1 else ''}/min"))
+    n = TRADES_EXACT + TRADES_LOG_BINS
+    for k in range(TRADES_LOG_BINS):
+        lo = (TRADES_EXACT + 1) * TRADES_STEP ** k
+        hi = (TRADES_EXACT + 1) * TRADES_STEP ** (k + 1)
+        b = TRADES_EXACT + k
+        label = f"{lo:,.0f}+ trades/min" if b == n - 1 else f"{lo:,.0f} - {hi:,.0f} trades/min"
+        out.append((TRADES_OFFSET + b, label))
+    return out
+
+
+def _sol(x: float) -> str:
+    return f"{x:,.0f}" if x >= 100 else f"{x:.3g}"
+
+
+def liquidity_vocab() -> list[tuple[int, str]]:
+    out = [(PAD, "PAD"), (LIQ_UNKNOWN, "UNKNOWN (no pool data)")]
+    edges = [10 ** x for x in LIQ_EDGES]
+    out.append((LIQ_OFFSET, f"< {_sol(edges[0])} SOL"))
+    for i in range(1, len(edges)):
+        out.append((LIQ_OFFSET + i, f"{_sol(edges[i - 1])} - {_sol(edges[i])} SOL"))
+    out.append((LIQ_OFFSET + len(edges), f">= {_sol(edges[-1])} SOL"))
     return out

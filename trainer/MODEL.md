@@ -1,26 +1,35 @@
 # Model inputs
 
-Generated 2026-11-25 00:14 UTC by `build_sequences.py`. Tokenization rules live in `dataset/tokenizer.py`.
+> [!IMPORTANT]
+> ## ⭐ MODEL INPUTS: 6 sequences × 120 tokens
+> Each sample = the last **120 candles of 30 seconds** (**60 minutes**) of one coin. Every candle becomes **one token in each of the 6 inputs**.
+>
+> | # | Input | Shape | Vocab | One token = | Built from (dataset column) |
+> |---|---|---|---|---|---|
+> | **1** | **`candle_tokens`** | **[batch, 120]** | 86 | **Candle**: price move vs previous close x candle range | `open`, `high`, `low`, `close`, `trades` |
+> | **2** | **`volume_tokens`** | **[batch, 120]** | 28 | **Volume**: SOL volume traded in the candle (log scale) | `volume_sol` |
+> | **3** | **`holder_tokens`** | **[batch, 120]** | 263 | **Holders**: number of holders at candle close (log scale) | `holders` |
+> | **4** | **`top10_tokens`** | **[batch, 120]** | 42 | **Top-10 concentration**: % of supply held by the 10 largest wallets | `top10_pct` |
+> | **5** | **`trades_tokens`** | **[batch, 120]** | 48 | **Trades per minute**: swaps in the last 60 seconds | `trades_per_min` |
+> | **6** | **`liquidity_tokens`** | **[batch, 120]** | 74 | **Liquidity**: total SOL in the coin's pools (log scale) | `liquidity_sol` |
+>
+> **Input tensor:** `x = [batch, 120, 6]` int16 token ids (`0` = PAD). Position 119 = the current candle *t*.
+>
+> **NOT inputs:** `target_*` (what to predict) and `outcome_*` (each coin's fate). Both contain the future. Feeding them to the model is look-ahead leakage.
+
+Generated 2026-11-25 00:28 UTC by `build_sequences.py`. Tokenization rules live in `dataset/tokenizer.py`.
 
 ## Overview
 
-Every training sample is one moment *t* in one token's life. The model sees the last **120 candles of 30 seconds** (= 60 minutes of history, candles *t-119* to *t*), as three parallel token sequences:
-
-| Input | Shape | dtype | Vocabulary | What one token encodes |
-|---|---|---|---|---|
-| `candle_tokens` | [batch, 120] | int16 | 86 | price move vs previous close x candle range |
-| `volume_tokens` | [batch, 120] | int16 | 28 | SOL volume traded in the candle (log scale) |
-| `holder_tokens` | [batch, 120] | int16 | 263 | number of holders at candle close (log scale) |
-
 - Position 0 is the oldest candle and position 119 is the current candle *t*.
-- Token id **0 = PAD** in all three streams. A coin younger than 120 candles is
+- Token id **0 = PAD** in every stream. A coin younger than 120 candles is
   **left-padded** with PAD, so the current candle is always at position 119. Mask with `tokens != 0`.
-- The three streams are aligned: position *i* in each stream describes the same candle.
+- All streams are aligned: position *i* in every stream describes the same candle.
 - Candles are evenly spaced. A 30s period with no swaps is still a step, with the tokens
   `NO_TRADE` (candle) and `ZERO` (volume).
 - Only data up to the close of candle *t* is used, so there is no look-ahead.
 
-## Stream 1: candle tokens (120)
+## ⭐ Input 1: `candle_tokens` [batch, 120]
 
 Each candle with at least one swap becomes one of 21 x 4 = 84 tokens:
 
@@ -32,19 +41,41 @@ Each candle with at least one swap becomes one of 21 x 4 = 84 tokens:
 `token = 2 + move_bin x 4 + range_bin`. A candle with no swaps is `NO_TRADE`.
 For the first candle of a coin, "previous close" is its own open.
 
-## Stream 2: volume tokens (120)
+## ⭐ Input 2: `volume_tokens` [batch, 120]
 
 SOL volume of the candle (buys + sells) on a log10 scale, in 0.25-decade steps
 (each bin is ~1.78x the previous one) from 0.001 SOL to 1000 SOL.
 Volume is absolute, not normalized per coin, because 0.1 SOL and 100 SOL of volume mean
 very different things for a memecoin. A candle with no volume is `ZERO`.
 
-## Stream 3: holder tokens (120)
+## ⭐ Input 3: `holder_tokens` [batch, 120]
 
 Number of wallets holding > 0 tokens at the close of each candle. 1-20 holders each have
 their own token. Above that, each bin covers 5% more holders than the previous one, so growth
 from 1,000 to 1,050 holders is still visible. `UNKNOWN` means no balance data was available.
 The holder history is rebuilt from on-chain balances (see [DATASET.md](DATASET.md)).
+
+## ⭐ Input 4: `top10_tokens` [batch, 120]
+
+% of the total supply held by the 10 largest wallets at candle close, in 2.5% steps
+(40 bins from 0% to 100%). Pools, bonding curves and other program-owned (PDA) accounts are
+excluded, because they're liquidity, not people who can dump. A high or rising value means a few
+wallets can crash the price. A falling value means big holders are selling or distributing.
+`UNKNOWN` means no balance data was available.
+
+## ⭐ Input 5: `trades_tokens` [batch, 120]
+
+Number of swaps in the last 60 seconds (the current 30s candle plus the previous one).
+1-10 trades/min each have their own token. Above that, each bin covers 25% more
+trades/min than the previous one. `ZERO` = no trades in the last minute (activity is dying).
+
+## ⭐ Input 6: `liquidity_tokens` [batch, 120]
+
+Total SOL in all of the coin's pools at candle close (pump.fun bonding curve + PumpSwap /
+Raydium / Meteora pools), on a log10 scale in 0.1-decade steps (each bin ~1.26x the
+previous) from 0.01 SOL to 100,000 SOL. When a coin graduates, the emptied
+bonding curve stops counting, so liquidity is not double-counted. A sudden drop in this
+stream is liquidity being pulled.
 
 ## Targets
 
@@ -55,28 +86,41 @@ Each sample carries the targets of its current candle *t*, from `build_dataset.p
 | `target_up_5m` | **1 if the price is more than 10% higher 5 minutes later** (suggested main target) |
 | `target_up_1m`, `target_up_10m` | same, 1 and 10 minutes ahead |
 | `target_ret_{1m,5m,10m}` | log return to that horizon (regression) |
+| `target_dump_{1m,5m,10m}` | **1 if the price falls more than 30% at any point within the horizon** (avoid / exit signal) |
 | `target_max_ret_*`, `target_min_ret_*` | best and worst price within the horizon (take-profit / stop-loss) |
+| `outcome_*` | per-coin fate: dead, graduated, ATH market cap, final drawdown, lifetime. Labels only, never inputs (see DATASET.md) |
 
-Other arrays in the file: `mint`, `timestamp` (unix seconds of candle *t*), `split` (train/val/test, per token) and `n_history` (real, non-PAD candles in the window).
+Other arrays in the file: `mint`, `segment`, `timestamp` (unix seconds of candle *t*), `split` (train/val/test, per token) and `n_history` (real, non-PAD candles in the window). Windows never span a gap in the downloaded data: a new `segment` starts with fresh padding.
 
 ## Suggested model
 
 ```
-candle_tokens ─ Embedding(86, d) ─┐
-volume_tokens ─ Embedding(28, d) ─┼─ sum ─ + positional embedding(120, d)
-holder_tokens ─ Embedding(263, d) ┘
+candle_tokens    ─ Embedding(86, d) ─┐
+volume_tokens    ─ Embedding(28, d) ─┤
+holder_tokens    ─ Embedding(263, d) ┤
+top10_tokens     ─ Embedding(42, d) ─┼─ sum ─ + positional embedding(120, d)
+trades_tokens    ─ Embedding(48, d) ─┤
+liquidity_tokens ─ Embedding(74, d) ─┘
       └─> Transformer encoder (causal or bidirectional, PAD masked)
             └─> representation at position 119 (current candle)
-                  └─> heads: P(up 5m) [BCE], return 5m [MSE], max/min return [MSE]
+                  └─> heads: P(up 5m) [BCE], P(dump 5m) [BCE], return 5m [MSE]
 ```
 
 Train on `split == "train"`, tune on `val` and report on `test`. Splits are by coin, so the test
 set only has coins the model has never seen.
 
+**Dead coins are in the data on purpose.** Most pump.fun launches die within minutes, so most
+samples are negative (`target_up_* = 0`, often `target_dump_* = 1`). That is the real
+distribution the model will trade in. Keep it, and handle the imbalance with class weights
+or a focal loss rather than by removing dead coins. When evaluating, check
+`outcome_dead` for the coins the model would have bought.
+
 ```python
 import numpy as np
 d = np.load("data/dataset/sequences_30s.npz")
-x = np.stack([d["candle_tokens"], d["volume_tokens"], d["holder_tokens"]], axis=-1)  # [N, 120, 3]
+streams = ["candle_tokens", "volume_tokens", "holder_tokens",
+           "top10_tokens", "trades_tokens", "liquidity_tokens"]
+x = np.stack([d[k] for k in streams], axis=-1)  # [N, 120, 6]
 y = d["target_up_5m"]
 train = d["split"] == "train"
 ```
@@ -480,5 +524,190 @@ train = d["split"] == "train"
 | 260 | 2,208,428 - 2,318,849 holders |
 | 261 | 2,318,850 - 2,434,791 holders |
 | 262 | 2,434,792 or more holders |
+
+</details>
+
+<details><summary><b>Top-10 concentration vocabulary (42 ids)</b></summary>
+
+| id | meaning |
+|---|---|
+| 0 | PAD |
+| 1 | UNKNOWN (no balance data) |
+| 2 | top 10 hold 0% - 2.5% |
+| 3 | top 10 hold 2.5% - 5% |
+| 4 | top 10 hold 5% - 7.5% |
+| 5 | top 10 hold 7.5% - 10% |
+| 6 | top 10 hold 10% - 12.5% |
+| 7 | top 10 hold 12.5% - 15% |
+| 8 | top 10 hold 15% - 17.5% |
+| 9 | top 10 hold 17.5% - 20% |
+| 10 | top 10 hold 20% - 22.5% |
+| 11 | top 10 hold 22.5% - 25% |
+| 12 | top 10 hold 25% - 27.5% |
+| 13 | top 10 hold 27.5% - 30% |
+| 14 | top 10 hold 30% - 32.5% |
+| 15 | top 10 hold 32.5% - 35% |
+| 16 | top 10 hold 35% - 37.5% |
+| 17 | top 10 hold 37.5% - 40% |
+| 18 | top 10 hold 40% - 42.5% |
+| 19 | top 10 hold 42.5% - 45% |
+| 20 | top 10 hold 45% - 47.5% |
+| 21 | top 10 hold 47.5% - 50% |
+| 22 | top 10 hold 50% - 52.5% |
+| 23 | top 10 hold 52.5% - 55% |
+| 24 | top 10 hold 55% - 57.5% |
+| 25 | top 10 hold 57.5% - 60% |
+| 26 | top 10 hold 60% - 62.5% |
+| 27 | top 10 hold 62.5% - 65% |
+| 28 | top 10 hold 65% - 67.5% |
+| 29 | top 10 hold 67.5% - 70% |
+| 30 | top 10 hold 70% - 72.5% |
+| 31 | top 10 hold 72.5% - 75% |
+| 32 | top 10 hold 75% - 77.5% |
+| 33 | top 10 hold 77.5% - 80% |
+| 34 | top 10 hold 80% - 82.5% |
+| 35 | top 10 hold 82.5% - 85% |
+| 36 | top 10 hold 85% - 87.5% |
+| 37 | top 10 hold 87.5% - 90% |
+| 38 | top 10 hold 90% - 92.5% |
+| 39 | top 10 hold 92.5% - 95% |
+| 40 | top 10 hold 95% - 97.5% |
+| 41 | top 10 hold 97.5% - 100% (or more) |
+
+</details>
+
+<details><summary><b>Trades per minute vocabulary (48 ids)</b></summary>
+
+| id | meaning |
+|---|---|
+| 0 | PAD |
+| 1 | ZERO (no trades in the last minute) |
+| 2 | 1 trade/min |
+| 3 | 2 trades/min |
+| 4 | 3 trades/min |
+| 5 | 4 trades/min |
+| 6 | 5 trades/min |
+| 7 | 6 trades/min |
+| 8 | 7 trades/min |
+| 9 | 8 trades/min |
+| 10 | 9 trades/min |
+| 11 | 10 trades/min |
+| 12 | 11 - 14 trades/min |
+| 13 | 14 - 17 trades/min |
+| 14 | 17 - 21 trades/min |
+| 15 | 21 - 27 trades/min |
+| 16 | 27 - 34 trades/min |
+| 17 | 34 - 42 trades/min |
+| 18 | 42 - 52 trades/min |
+| 19 | 52 - 66 trades/min |
+| 20 | 66 - 82 trades/min |
+| 21 | 82 - 102 trades/min |
+| 22 | 102 - 128 trades/min |
+| 23 | 128 - 160 trades/min |
+| 24 | 160 - 200 trades/min |
+| 25 | 200 - 250 trades/min |
+| 26 | 250 - 313 trades/min |
+| 27 | 313 - 391 trades/min |
+| 28 | 391 - 488 trades/min |
+| 29 | 488 - 611 trades/min |
+| 30 | 611 - 763 trades/min |
+| 31 | 763 - 954 trades/min |
+| 32 | 954 - 1,193 trades/min |
+| 33 | 1,193 - 1,491 trades/min |
+| 34 | 1,491 - 1,863 trades/min |
+| 35 | 1,863 - 2,329 trades/min |
+| 36 | 2,329 - 2,912 trades/min |
+| 37 | 2,912 - 3,640 trades/min |
+| 38 | 3,640 - 4,549 trades/min |
+| 39 | 4,549 - 5,687 trades/min |
+| 40 | 5,687 - 7,109 trades/min |
+| 41 | 7,109 - 8,886 trades/min |
+| 42 | 8,886 - 11,107 trades/min |
+| 43 | 11,107 - 13,884 trades/min |
+| 44 | 13,884 - 17,355 trades/min |
+| 45 | 17,355 - 21,694 trades/min |
+| 46 | 21,694 - 27,117 trades/min |
+| 47 | 27,117+ trades/min |
+
+</details>
+
+<details><summary><b>Liquidity vocabulary (74 ids)</b></summary>
+
+| id | meaning |
+|---|---|
+| 0 | PAD |
+| 1 | UNKNOWN (no pool data) |
+| 2 | < 0.01 SOL |
+| 3 | 0.01 - 0.0126 SOL |
+| 4 | 0.0126 - 0.0158 SOL |
+| 5 | 0.0158 - 0.02 SOL |
+| 6 | 0.02 - 0.0251 SOL |
+| 7 | 0.0251 - 0.0316 SOL |
+| 8 | 0.0316 - 0.0398 SOL |
+| 9 | 0.0398 - 0.0501 SOL |
+| 10 | 0.0501 - 0.0631 SOL |
+| 11 | 0.0631 - 0.0794 SOL |
+| 12 | 0.0794 - 0.1 SOL |
+| 13 | 0.1 - 0.126 SOL |
+| 14 | 0.126 - 0.158 SOL |
+| 15 | 0.158 - 0.2 SOL |
+| 16 | 0.2 - 0.251 SOL |
+| 17 | 0.251 - 0.316 SOL |
+| 18 | 0.316 - 0.398 SOL |
+| 19 | 0.398 - 0.501 SOL |
+| 20 | 0.501 - 0.631 SOL |
+| 21 | 0.631 - 0.794 SOL |
+| 22 | 0.794 - 1 SOL |
+| 23 | 1 - 1.26 SOL |
+| 24 | 1.26 - 1.58 SOL |
+| 25 | 1.58 - 2 SOL |
+| 26 | 2 - 2.51 SOL |
+| 27 | 2.51 - 3.16 SOL |
+| 28 | 3.16 - 3.98 SOL |
+| 29 | 3.98 - 5.01 SOL |
+| 30 | 5.01 - 6.31 SOL |
+| 31 | 6.31 - 7.94 SOL |
+| 32 | 7.94 - 10 SOL |
+| 33 | 10 - 12.6 SOL |
+| 34 | 12.6 - 15.8 SOL |
+| 35 | 15.8 - 20 SOL |
+| 36 | 20 - 25.1 SOL |
+| 37 | 25.1 - 31.6 SOL |
+| 38 | 31.6 - 39.8 SOL |
+| 39 | 39.8 - 50.1 SOL |
+| 40 | 50.1 - 63.1 SOL |
+| 41 | 63.1 - 79.4 SOL |
+| 42 | 79.4 - 100 SOL |
+| 43 | 100 - 126 SOL |
+| 44 | 126 - 158 SOL |
+| 45 | 158 - 200 SOL |
+| 46 | 200 - 251 SOL |
+| 47 | 251 - 316 SOL |
+| 48 | 316 - 398 SOL |
+| 49 | 398 - 501 SOL |
+| 50 | 501 - 631 SOL |
+| 51 | 631 - 794 SOL |
+| 52 | 794 - 1,000 SOL |
+| 53 | 1,000 - 1,259 SOL |
+| 54 | 1,259 - 1,585 SOL |
+| 55 | 1,585 - 1,995 SOL |
+| 56 | 1,995 - 2,512 SOL |
+| 57 | 2,512 - 3,162 SOL |
+| 58 | 3,162 - 3,981 SOL |
+| 59 | 3,981 - 5,012 SOL |
+| 60 | 5,012 - 6,310 SOL |
+| 61 | 6,310 - 7,943 SOL |
+| 62 | 7,943 - 10,000 SOL |
+| 63 | 10,000 - 12,589 SOL |
+| 64 | 12,589 - 15,849 SOL |
+| 65 | 15,849 - 19,953 SOL |
+| 66 | 19,953 - 25,119 SOL |
+| 67 | 25,119 - 31,623 SOL |
+| 68 | 31,623 - 39,811 SOL |
+| 69 | 39,811 - 50,119 SOL |
+| 70 | 50,119 - 63,096 SOL |
+| 71 | 63,096 - 79,433 SOL |
+| 72 | 79,433 - 100,000 SOL |
+| 73 | >= 100,000 SOL |
 
 </details>
