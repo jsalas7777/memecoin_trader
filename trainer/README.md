@@ -8,8 +8,8 @@ Implemented so far:
 2. `build_dataset.py`: turn it into an ML dataset of **30-second candles** with holder counts,
    engineered features and future-return targets. Every input is described in [DATASET.md](DATASET.md).
 3. `build_sequences.py`: tokenized model inputs. For each moment, the last **120 candles** become
-   120 tokens each of candle, volume, holders, top-10 concentration, trades per minute,
-   liquidity, bonding curve progress, launch bundle, whale buy and whale sell (10 streams).
+   120 tokens each of candle, volume, holders and bonding curve progress (4 inputs; top-10, trades
+   per minute, liquidity, bundle and whale buy/sell exist but are switched off, see MODEL.md).
    The spec is in [MODEL.md](MODEL.md).
 
 ## Data sources
@@ -21,6 +21,43 @@ Implemented so far:
 
 `build_dataset.py --source auto` (default) uses GMGN candles and fills in on-chain columns wherever on-chain data
 exists. Inputs nobody has data for become `UNKNOWN` tokens, never guessed values.
+
+### No keys: one command
+
+```bash
+cd trainer
+.venv/bin/python download_free.py                 # 500 coins from the last 3 days, then builds the training data
+.venv/bin/python download_free.py --coins 2000 --days 7
+```
+
+Finds pump.fun launches on the free public Solana RPC (sampled evenly, dead coins included), downloads each
+from GMGN with its public test key, then builds `dataset_30s.csv` + `sequences_30s.npz`. Progress bars for
+every step; rate limits are announced with the pause length. Ctrl+C is safe: rerun to continue. Each run adds
+`--coins` new coins. Uses `GMGN_API_KEY` / `SOLANA_RPC_URL` instead when they're set (much faster).
+
+### From a trade archive (fastest: tens of thousands of coins in minutes)
+
+```bash
+.venv/bin/python download_archive.py      # 1 day of every pump.fun trade (~1.5 GB) -> archives/ (not in git)
+.venv/bin/python import_archive.py        # -> data/dataset/pumpdata-2026-10-15_30s/ (all inputs, verified)
+.venv/bin/python train.py --dataset data/dataset/pumpdata-2026-10-15_30s
+```
+
+`import_archive.py` takes every coin launched in the archive (so each starts at its first trade), builds
+30s candles, holders, top-10, liquidity, curve progress, launch bundle and whale buys/sells exactly like
+`build_dataset.py`, in parallel, and checks a sample with the input verifier. `--limit 2000` for a quick run.
+`download_archive.py corpus` gets a 39-day archive (~6.7 GB). Mayhem-mode coins (pump.fun's agent trades
+their curve) get a 2B supply and `UNKNOWN` curve progress.
+
+### Train the model
+
+```bash
+.venv/bin/python train.py          # causal transformer, best checkpoint -> data/models/transformer_30s.pt
+.venv/bin/python predict.py        # 24-candle forecast for a test coin vs what actually happened
+```
+
+The model reads each coin from its first candle (no waiting for 120 candles) and, at every candle,
+forecasts the next 24 candles: candle shape, volume and the price path. Details in [MODEL.md](MODEL.md).
 
 ### GMGN quick start
 
@@ -79,7 +116,7 @@ python download_data.py ohlcv --intervals 15s,1min,15min
 # 3. Build the ML dataset -> data/dataset/dataset_30s.csv + DATASET.md
 python build_dataset.py --interval 30s --horizons 1min,5min,10min --up-threshold 0.10
 
-# 4. Tokenize into 10 x 120-token model inputs -> data/dataset/sequences_30s.npz + MODEL.md
+# 4. Tokenize into 4 x 120-token model inputs -> data/dataset/sequences_30s.npz + MODEL.md
 #    (runs the input verification automatically and fails if any input is wrong)
 python build_sequences.py
 
@@ -103,7 +140,7 @@ data/
   ohlcv/<interval>/<mint>.csv   candles
   state/<mint>.json             pagination cursors + token metadata
   dataset/dataset_30s.csv       ML dataset (features + targets), see DATASET.md
-  dataset/sequences_30s.npz     tokenized 10 x 120 model inputs + targets, see MODEL.md
+  dataset/sequences_30s.npz     tokenized model inputs (4 x 120) + targets, see MODEL.md
 ```
 
 **trades/<mint>.csv**: `signature, slot, tx_index, block_time, datetime, dex, pool_vault, side (buy|sell),

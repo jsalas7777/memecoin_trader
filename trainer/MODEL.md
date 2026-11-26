@@ -1,27 +1,21 @@
 # Model inputs
 
 > [!IMPORTANT]
-> ## ⭐ MODEL INPUTS: 10 sequences × 120 tokens
-> Each sample = the last **120 candles of 30 seconds** (**60 minutes**) of one coin. Every candle becomes **one token in each of the 10 inputs**.
+> ## ⭐ MODEL INPUTS: 4 sequences × 120 tokens
+> Each sample = the last **120 candles of 30 seconds** (**60 minutes**) of one coin. Every candle becomes **one token in each of the 4 inputs**.
 >
 > | # | Input | Shape | Vocab | One token = | Built from (dataset column) |
 > |---|---|---|---|---|---|
 > | **1** | **`candle_tokens`** | **[batch, 120]** | 86 | **Candle**: price move vs previous close x candle range | `open`, `high`, `low`, `close`, `volume_sol` |
 > | **2** | **`volume_tokens`** | **[batch, 120]** | 28 | **Volume**: SOL volume traded in the candle (log scale) | `volume_sol` |
 > | **3** | **`holder_tokens`** | **[batch, 120]** | 263 | **Holders**: number of holders at candle close (log scale) | `holders` |
-> | **4** | **`top10_tokens`** | **[batch, 120]** | 42 | **Top-10 concentration**: % of supply held by the 10 largest wallets | `top10_pct` |
-> | **5** | **`trades_tokens`** | **[batch, 120]** | 49 | **Trades per minute**: swaps in the last 60 seconds | `trades_per_min` |
-> | **6** | **`liquidity_tokens`** | **[batch, 120]** | 74 | **Liquidity**: total SOL in the coin's pools (log scale) | `liquidity_sol` |
-> | **7** | **`curve_tokens`** | **[batch, 120]** | 43 | **Bonding curve progress**: % of the pump.fun curve sold, or GRADUATED | `curve_progress_pct`, `graduated` |
-> | **8** | **`bundle_tokens`** | **[batch, 120]** | 40 | **Launch bundle**: % of supply the launch-block wallets still hold | `bundle_pct`, `bundle_launch_pct` |
-> | **9** | **`whale_buy_tokens`** | **[batch, 120]** | 29 | **Whale buy**: biggest buy by one wallet in the candle (SOL, log scale) | `max_buy_sol` |
-> | **10** | **`whale_sell_tokens`** | **[batch, 120]** | 29 | **Whale sell**: biggest sell by one wallet in the candle (SOL, log scale) | `max_sell_sol` |
+> | **4** | **`curve_tokens`** | **[batch, 120]** | 43 | **Bonding curve progress**: % of the pump.fun curve sold, or GRADUATED | `curve_progress_pct`, `graduated` |
 >
-> **Input tensor:** `x = [batch, 120, 10]` int16 token ids (`0` = PAD). Position 119 = the current candle *t*.
+> **Input tensor:** `x = [batch, 120, 4]` int16 token ids (`0` = PAD). Position 119 = the current candle *t*.
 >
 > **NOT inputs:** `target_*` (what to predict) and `outcome_*` (each coin's fate). Both contain the future. Feeding them to the model is look-ahead leakage.
 
-Generated 2026-11-25 18:16 UTC by `build_sequences.py`. Tokenization rules live in `dataset/tokenizer.py`.
+Generated 2026-11-26 21:14 UTC by `build_sequences.py`. Tokenization rules live in `dataset/tokenizer.py`.
 
 ## Overview
 
@@ -62,33 +56,7 @@ from 1,000 to 1,050 holders is still visible. `UNKNOWN` means no holder history 
 Holder history comes from exact on-chain balances, or else from GMGN wallet holding periods
 (exact for coins with fewer than 100 wallets, which covers most dead coins). See [DATASET.md](DATASET.md).
 
-## ⭐ Input 4: `top10_tokens` [batch, 120]
-
-% of the total supply held by the 10 largest wallets at candle close, in 2.5% steps
-(40 bins from 0% to 100%). Pools, bonding curves and other program-owned (PDA) accounts are
-excluded, because they're liquidity, not people who can dump. A high or rising value means a few
-wallets can crash the price. A falling value means big holders are selling or distributing.
-`UNKNOWN` means no balance data was available. This stream needs on-chain data, because GMGN
-has no top-10 history.
-
-## ⭐ Input 5: `trades_tokens` [batch, 120]
-
-Number of swaps in the last 60 seconds (the current 30s candle plus the previous one).
-1-10 trades/min each have their own token. Above that, each bin covers 25% more
-trades/min than the previous one. `ZERO` = no trades in the last minute (activity is dying).
-`UNKNOWN` = the trade count isn't available (GMGN candles have volume but no trade count; it is
-filled from on-chain data where that exists).
-
-## ⭐ Input 6: `liquidity_tokens` [batch, 120]
-
-Total SOL in all of the coin's pools at candle close (pump.fun bonding curve + PumpSwap /
-Raydium / Meteora pools), on a log10 scale in 0.1-decade steps (each bin ~1.26x the
-previous) from 0.01 SOL to 100,000 SOL. When a coin graduates, the emptied
-bonding curve stops counting, so liquidity is not double-counted. A sudden drop in this
-stream is liquidity being pulled. This stream needs on-chain data (GMGN has no liquidity
-history); it is `UNKNOWN` otherwise.
-
-## ⭐ Input 7: `curve_tokens` [batch, 120]
+## ⭐ Input 4: `curve_tokens` [batch, 120]
 
 How far the coin is along the pump.fun bonding curve at candle close, in 2.5% steps
 (40 bins). 0% = just launched; 100% = all 793.1M sellable tokens bought and the curve is complete.
@@ -98,25 +66,9 @@ On-chain: exact, from the tokens left in the curve's vault (1B at launch, 206.9M
 GMGN: from the price, using the curve's constant-product formula (within ~1 point), and
 `GRADUATED` from GMGN's migration time. `UNKNOWN` = not a pump.fun coin.
 
-## ⭐ Input 8: `bundle_tokens` [batch, 120]
+## Inputs switched off
 
-% of the total supply still held by the wallets that bought in the **launch block** (the same
-slot as the create transaction: the dev's own buy plus any wallets bundled with it), at candle close.
-1% steps up to 20%, then 5% steps. A big bundle means a few insiders control the supply; the
-stream falling means they are selling into buyers.
-`NO_BUNDLE` = nobody bought in the launch block. `SOLD_OUT` = they bought and have sold
-(less than 0.05% of supply left). `UNKNOWN` = the downloaded history doesn't reach back to the
-launch, or the candles are GMGN-only (this stream needs on-chain data from creation).
-Program-owned (PDA) accounts such as the curve itself are never counted.
-
-## ⭐ Inputs 9 and 10: `whale_buy_tokens`, `whale_sell_tokens` [batch, 120]
-
-The biggest amount of SOL **one wallet** bought (input 9) and sold (input 10) in the candle.
-A wallet's swaps in the same candle are added up, so splitting a buy into small swaps doesn't
-hide it. Same log scale as volume (0.001 SOL to 1000 SOL, 0.25-decade steps).
-Together with volume, it shows whether a move is one whale or many small traders; a whale
-sell next to thin liquidity is a dump warning. `NONE` = no buys (sells) in the candle.
-`UNKNOWN` = per-wallet amounts not available (GMGN candles have no trade list; on-chain fills it).
+These streams exist in the code but are **not given to the model**: `top10_tokens` (Top-10 concentration), `trades_tokens` (Trades per minute), `liquidity_tokens` (Liquidity), `bundle_tokens` (Launch bundle), `whale_buy_tokens` (Whale buy), `whale_sell_tokens` (Whale sell). They need on-chain swap data, which the keyless GMGN download (`download_free.py`) doesn't have, so they would be almost all `UNKNOWN`. To use them again, download on-chain data (`download_data.py history`) and add their names to `MODEL_STREAMS` in `dataset/tokenizer.py`.
 
 ## Targets
 
@@ -133,42 +85,63 @@ Each sample carries the targets of its current candle *t*, from `build_dataset.p
 
 Other arrays in the file: `mint`, `segment`, `timestamp` (unix seconds of candle *t*), `split` (train/val/test, per token) and `n_history` (real, non-PAD candles in the window). Windows never span a gap in the downloaded data: a new `segment` starts with fresh padding.
 
-## Suggested model
+## ⭐ The model: causal transformer, 24-candle forecast (`train.py`)
+
+> [!IMPORTANT]
+> **Sequential training from the very first candle.** The model is causal (GPT-style): at candle *t* it
+> only sees candles 0..*t* of the coin. Every candle is a training example: candle 0 trains with
+> 1 candle of history, candle 1 with 2, and so on. **Nothing waits for 120 candles.** Empty
+> or `UNKNOWN` inputs are ordinary tokens, so a coin trains from its first 30 seconds on.
+>
+> **Output: the next 24 candles (12 minutes) at every candle.**
 
 ```
-candle_tokens    ─ Embedding(86, d) ─┐
-volume_tokens    ─ Embedding(28, d) ─┤
-holder_tokens    ─ Embedding(263, d) ┤
-top10_tokens     ─ Embedding(42, d) ─┼─ sum ─ + positional embedding(120, d)
-trades_tokens    ─ Embedding(49, d) ─┤
-liquidity_tokens ─ Embedding(74, d) ─┤
-curve_tokens     ─ Embedding(43, d) ─┤
-bundle_tokens    ─ Embedding(40, d) ─┤
-whale_buy_tokens ─ Embedding(29, d) ─┤
-whale_sell_tokens─ Embedding(29, d) ─┘
-      └─> Transformer encoder (causal or bidirectional, PAD masked)
-            └─> representation at position 119 (current candle)
-                  └─> heads: P(up 5m) [BCE], P(dump 5m) [BCE], return 5m [MSE]
+per candle t, one token from each of the 4 inputs ── Embedding per input ──┐
+coin age since launch (64 buckets) ──────────────────── Embedding ─────────────┼─ sum
+position in the window (0..119) ─────────────────────── Embedding ─────────────┘
+   └─> causal Transformer (default: d_model 128, 4 layers, 4 heads, ~1.3M parameters)
+         └─> at EVERY position t: 3 heads, each forecasting candles t+1 .. t+24
+               candle [24 x 86]  which candle token comes next (move x range, or NO_TRADE)
+               volume [24 x 28]  its volume token
+               ret    [24]       log(close[t+k] / close[t]): the price path from now
 ```
 
-Train on `split == "train"`, tune on `val` and report on `test`. Splits are by coin, so the test
-set only has coins the model has never seen.
+| Output | Shape | Loss | Meaning |
+|---|---|---|---|
+| `candle` | [batch, T, 24, 86] | cross-entropy | probabilities of each candle token for each of the next 24 candles |
+| `volume` | [batch, T, 24, 28] | cross-entropy (x0.5) | volume token of each of the next 24 candles |
+| `ret` | [batch, T, 24] | Huber | predicted price change from now to each of the next 24 candles (log ratio) |
+
+**How coins are fed.** Each coin (each `segment`) is one sequence starting at its first candle.
+Coins longer than 120 candles are cut into overlapping windows (120 long, step 60); the first
+window trains every position, later windows only the positions the previous one didn't reach,
+so each candle is trained exactly once per epoch, with at least 60 candles of history once
+it is past the first window. Future candles beyond the downloaded data are masked out of the loss.
+Dead coins keep 24 empty candles after their last trade, so "it dies" is a forecast the model learns.
+
+```bash
+python train.py                  # trains on data/dataset/dataset_30s.csv, best model -> data/models/transformer_30s.pt
+python train.py --quick          # 2-epoch smoke test
+python train.py --epochs 50 --d-model 256 --layers 6
+python predict.py                # print a 24-candle forecast for a test coin vs what actually happened
+```
+
+Train on `split == "train"`, early-stop on `val`, report on `test`. Splits are by coin, so the test
+set only has coins the model has never seen. Each epoch prints next-candle accuracy, the 5-minute
+return error next to the "price doesn't move" baseline, and direction accuracy on moves > 5%.
+The model is only useful where it beats that baseline on `test`.
 
 **Dead coins are in the data on purpose.** Most pump.fun launches die within minutes, so most
-samples are negative (`target_up_* = 0`, often `target_dump_* = 1`). That is the real
-distribution the model will trade in. Keep it, and handle the imbalance with class weights
-or a focal loss rather than by removing dead coins. When evaluating, check
-`outcome_dead` for the coins the model would have bought.
+forecasts are "flat / NO_TRADE / down". That is the real distribution the bot will trade in; keep
+it. When evaluating, check `outcome_dead` for the coins the model would have bought.
+
+`sequences_30s.npz` (fixed 120-candle windows, verified above) is still written for other
+model types:
 
 ```python
 import numpy as np
 d = np.load("data/dataset/sequences_30s.npz")
-streams = ["candle_tokens", "volume_tokens", "holder_tokens",
-           "top10_tokens", "trades_tokens", "liquidity_tokens",
-           "curve_tokens", "bundle_tokens", "whale_buy_tokens", "whale_sell_tokens"]
-x = np.stack([d[k] for k in streams], axis=-1)  # [N, 120, 10]
-y = d["target_up_5m"]
-train = d["split"] == "train"
+x = np.stack([d[k] for k in ['candle_tokens', 'volume_tokens', 'holder_tokens', 'curve_tokens']], axis=-1)  # [N, 120, 4]
 ```
 
 ## Vocabularies
@@ -573,192 +546,6 @@ train = d["split"] == "train"
 
 </details>
 
-<details><summary><b>Top-10 concentration vocabulary (42 ids)</b></summary>
-
-| id | meaning |
-|---|---|
-| 0 | PAD |
-| 1 | UNKNOWN (no balance data) |
-| 2 | top 10 hold 0% - 2.5% |
-| 3 | top 10 hold 2.5% - 5% |
-| 4 | top 10 hold 5% - 7.5% |
-| 5 | top 10 hold 7.5% - 10% |
-| 6 | top 10 hold 10% - 12.5% |
-| 7 | top 10 hold 12.5% - 15% |
-| 8 | top 10 hold 15% - 17.5% |
-| 9 | top 10 hold 17.5% - 20% |
-| 10 | top 10 hold 20% - 22.5% |
-| 11 | top 10 hold 22.5% - 25% |
-| 12 | top 10 hold 25% - 27.5% |
-| 13 | top 10 hold 27.5% - 30% |
-| 14 | top 10 hold 30% - 32.5% |
-| 15 | top 10 hold 32.5% - 35% |
-| 16 | top 10 hold 35% - 37.5% |
-| 17 | top 10 hold 37.5% - 40% |
-| 18 | top 10 hold 40% - 42.5% |
-| 19 | top 10 hold 42.5% - 45% |
-| 20 | top 10 hold 45% - 47.5% |
-| 21 | top 10 hold 47.5% - 50% |
-| 22 | top 10 hold 50% - 52.5% |
-| 23 | top 10 hold 52.5% - 55% |
-| 24 | top 10 hold 55% - 57.5% |
-| 25 | top 10 hold 57.5% - 60% |
-| 26 | top 10 hold 60% - 62.5% |
-| 27 | top 10 hold 62.5% - 65% |
-| 28 | top 10 hold 65% - 67.5% |
-| 29 | top 10 hold 67.5% - 70% |
-| 30 | top 10 hold 70% - 72.5% |
-| 31 | top 10 hold 72.5% - 75% |
-| 32 | top 10 hold 75% - 77.5% |
-| 33 | top 10 hold 77.5% - 80% |
-| 34 | top 10 hold 80% - 82.5% |
-| 35 | top 10 hold 82.5% - 85% |
-| 36 | top 10 hold 85% - 87.5% |
-| 37 | top 10 hold 87.5% - 90% |
-| 38 | top 10 hold 90% - 92.5% |
-| 39 | top 10 hold 92.5% - 95% |
-| 40 | top 10 hold 95% - 97.5% |
-| 41 | top 10 hold 97.5% - 100% (or more) |
-
-</details>
-
-<details><summary><b>Trades per minute vocabulary (49 ids)</b></summary>
-
-| id | meaning |
-|---|---|
-| 0 | PAD |
-| 1 | ZERO (no trades in the last minute) |
-| 2 | UNKNOWN (trade count not available for this candle) |
-| 3 | 1 trade/min |
-| 4 | 2 trades/min |
-| 5 | 3 trades/min |
-| 6 | 4 trades/min |
-| 7 | 5 trades/min |
-| 8 | 6 trades/min |
-| 9 | 7 trades/min |
-| 10 | 8 trades/min |
-| 11 | 9 trades/min |
-| 12 | 10 trades/min |
-| 13 | 11 - 14 trades/min |
-| 14 | 14 - 17 trades/min |
-| 15 | 17 - 21 trades/min |
-| 16 | 21 - 27 trades/min |
-| 17 | 27 - 34 trades/min |
-| 18 | 34 - 42 trades/min |
-| 19 | 42 - 52 trades/min |
-| 20 | 52 - 66 trades/min |
-| 21 | 66 - 82 trades/min |
-| 22 | 82 - 102 trades/min |
-| 23 | 102 - 128 trades/min |
-| 24 | 128 - 160 trades/min |
-| 25 | 160 - 200 trades/min |
-| 26 | 200 - 250 trades/min |
-| 27 | 250 - 313 trades/min |
-| 28 | 313 - 391 trades/min |
-| 29 | 391 - 488 trades/min |
-| 30 | 488 - 611 trades/min |
-| 31 | 611 - 763 trades/min |
-| 32 | 763 - 954 trades/min |
-| 33 | 954 - 1,193 trades/min |
-| 34 | 1,193 - 1,491 trades/min |
-| 35 | 1,491 - 1,863 trades/min |
-| 36 | 1,863 - 2,329 trades/min |
-| 37 | 2,329 - 2,912 trades/min |
-| 38 | 2,912 - 3,640 trades/min |
-| 39 | 3,640 - 4,549 trades/min |
-| 40 | 4,549 - 5,687 trades/min |
-| 41 | 5,687 - 7,109 trades/min |
-| 42 | 7,109 - 8,886 trades/min |
-| 43 | 8,886 - 11,107 trades/min |
-| 44 | 11,107 - 13,884 trades/min |
-| 45 | 13,884 - 17,355 trades/min |
-| 46 | 17,355 - 21,694 trades/min |
-| 47 | 21,694 - 27,117 trades/min |
-| 48 | 27,117+ trades/min |
-
-</details>
-
-<details><summary><b>Liquidity vocabulary (74 ids)</b></summary>
-
-| id | meaning |
-|---|---|
-| 0 | PAD |
-| 1 | UNKNOWN (no pool data) |
-| 2 | < 0.01 SOL |
-| 3 | 0.01 - 0.0126 SOL |
-| 4 | 0.0126 - 0.0158 SOL |
-| 5 | 0.0158 - 0.02 SOL |
-| 6 | 0.02 - 0.0251 SOL |
-| 7 | 0.0251 - 0.0316 SOL |
-| 8 | 0.0316 - 0.0398 SOL |
-| 9 | 0.0398 - 0.0501 SOL |
-| 10 | 0.0501 - 0.0631 SOL |
-| 11 | 0.0631 - 0.0794 SOL |
-| 12 | 0.0794 - 0.1 SOL |
-| 13 | 0.1 - 0.126 SOL |
-| 14 | 0.126 - 0.158 SOL |
-| 15 | 0.158 - 0.2 SOL |
-| 16 | 0.2 - 0.251 SOL |
-| 17 | 0.251 - 0.316 SOL |
-| 18 | 0.316 - 0.398 SOL |
-| 19 | 0.398 - 0.501 SOL |
-| 20 | 0.501 - 0.631 SOL |
-| 21 | 0.631 - 0.794 SOL |
-| 22 | 0.794 - 1 SOL |
-| 23 | 1 - 1.26 SOL |
-| 24 | 1.26 - 1.58 SOL |
-| 25 | 1.58 - 2 SOL |
-| 26 | 2 - 2.51 SOL |
-| 27 | 2.51 - 3.16 SOL |
-| 28 | 3.16 - 3.98 SOL |
-| 29 | 3.98 - 5.01 SOL |
-| 30 | 5.01 - 6.31 SOL |
-| 31 | 6.31 - 7.94 SOL |
-| 32 | 7.94 - 10 SOL |
-| 33 | 10 - 12.6 SOL |
-| 34 | 12.6 - 15.8 SOL |
-| 35 | 15.8 - 20 SOL |
-| 36 | 20 - 25.1 SOL |
-| 37 | 25.1 - 31.6 SOL |
-| 38 | 31.6 - 39.8 SOL |
-| 39 | 39.8 - 50.1 SOL |
-| 40 | 50.1 - 63.1 SOL |
-| 41 | 63.1 - 79.4 SOL |
-| 42 | 79.4 - 100 SOL |
-| 43 | 100 - 126 SOL |
-| 44 | 126 - 158 SOL |
-| 45 | 158 - 200 SOL |
-| 46 | 200 - 251 SOL |
-| 47 | 251 - 316 SOL |
-| 48 | 316 - 398 SOL |
-| 49 | 398 - 501 SOL |
-| 50 | 501 - 631 SOL |
-| 51 | 631 - 794 SOL |
-| 52 | 794 - 1,000 SOL |
-| 53 | 1,000 - 1,259 SOL |
-| 54 | 1,259 - 1,585 SOL |
-| 55 | 1,585 - 1,995 SOL |
-| 56 | 1,995 - 2,512 SOL |
-| 57 | 2,512 - 3,162 SOL |
-| 58 | 3,162 - 3,981 SOL |
-| 59 | 3,981 - 5,012 SOL |
-| 60 | 5,012 - 6,310 SOL |
-| 61 | 6,310 - 7,943 SOL |
-| 62 | 7,943 - 10,000 SOL |
-| 63 | 10,000 - 12,589 SOL |
-| 64 | 12,589 - 15,849 SOL |
-| 65 | 15,849 - 19,953 SOL |
-| 66 | 19,953 - 25,119 SOL |
-| 67 | 25,119 - 31,623 SOL |
-| 68 | 31,623 - 39,811 SOL |
-| 69 | 39,811 - 50,119 SOL |
-| 70 | 50,119 - 63,096 SOL |
-| 71 | 63,096 - 79,433 SOL |
-| 72 | 79,433 - 100,000 SOL |
-| 73 | >= 100,000 SOL |
-
-</details>
-
 <details><summary><b>Bonding curve progress vocabulary (43 ids)</b></summary>
 
 | id | meaning |
@@ -806,124 +593,5 @@ train = d["split"] == "train"
 | 40 | curve 92.5% - 95% complete |
 | 41 | curve 95% - 97.5% complete |
 | 42 | curve 97.5% - 100% complete |
-
-</details>
-
-<details><summary><b>Launch bundle vocabulary (40 ids)</b></summary>
-
-| id | meaning |
-|---|---|
-| 0 | PAD |
-| 1 | UNKNOWN (history doesn't reach the launch block) |
-| 2 | NO_BUNDLE (nobody bought in the launch block) |
-| 3 | SOLD_OUT (launch-block wallets hold < 0.05% of supply now) |
-| 4 | bundle holds 0.05% - 1% |
-| 5 | bundle holds 1% - 2% |
-| 6 | bundle holds 2% - 3% |
-| 7 | bundle holds 3% - 4% |
-| 8 | bundle holds 4% - 5% |
-| 9 | bundle holds 5% - 6% |
-| 10 | bundle holds 6% - 7% |
-| 11 | bundle holds 7% - 8% |
-| 12 | bundle holds 8% - 9% |
-| 13 | bundle holds 9% - 10% |
-| 14 | bundle holds 10% - 11% |
-| 15 | bundle holds 11% - 12% |
-| 16 | bundle holds 12% - 13% |
-| 17 | bundle holds 13% - 14% |
-| 18 | bundle holds 14% - 15% |
-| 19 | bundle holds 15% - 16% |
-| 20 | bundle holds 16% - 17% |
-| 21 | bundle holds 17% - 18% |
-| 22 | bundle holds 18% - 19% |
-| 23 | bundle holds 19% - 20% |
-| 24 | bundle holds 20% - 25% |
-| 25 | bundle holds 25% - 30% |
-| 26 | bundle holds 30% - 35% |
-| 27 | bundle holds 35% - 40% |
-| 28 | bundle holds 40% - 45% |
-| 29 | bundle holds 45% - 50% |
-| 30 | bundle holds 50% - 55% |
-| 31 | bundle holds 55% - 60% |
-| 32 | bundle holds 60% - 65% |
-| 33 | bundle holds 65% - 70% |
-| 34 | bundle holds 70% - 75% |
-| 35 | bundle holds 75% - 80% |
-| 36 | bundle holds 80% - 85% |
-| 37 | bundle holds 85% - 90% |
-| 38 | bundle holds 90% - 95% |
-| 39 | bundle holds > 95% |
-
-</details>
-
-<details><summary><b>Whale buy vocabulary (29 ids)</b></summary>
-
-| id | meaning |
-|---|---|
-| 0 | PAD |
-| 1 | NONE (no buys in this candle) |
-| 2 | UNKNOWN (per-wallet amounts not available) |
-| 3 | biggest buy < 0.001 SOL |
-| 4 | biggest buy 0.001 - 0.001778 SOL |
-| 5 | biggest buy 0.001778 - 0.003162 SOL |
-| 6 | biggest buy 0.003162 - 0.005623 SOL |
-| 7 | biggest buy 0.005623 - 0.01 SOL |
-| 8 | biggest buy 0.01 - 0.01778 SOL |
-| 9 | biggest buy 0.01778 - 0.03162 SOL |
-| 10 | biggest buy 0.03162 - 0.05623 SOL |
-| 11 | biggest buy 0.05623 - 0.1 SOL |
-| 12 | biggest buy 0.1 - 0.1778 SOL |
-| 13 | biggest buy 0.1778 - 0.3162 SOL |
-| 14 | biggest buy 0.3162 - 0.5623 SOL |
-| 15 | biggest buy 0.5623 - 1 SOL |
-| 16 | biggest buy 1 - 1.778 SOL |
-| 17 | biggest buy 1.778 - 3.162 SOL |
-| 18 | biggest buy 3.162 - 5.623 SOL |
-| 19 | biggest buy 5.623 - 10 SOL |
-| 20 | biggest buy 10 - 17.78 SOL |
-| 21 | biggest buy 17.78 - 31.62 SOL |
-| 22 | biggest buy 31.62 - 56.23 SOL |
-| 23 | biggest buy 56.23 - 100 SOL |
-| 24 | biggest buy 100 - 177.8 SOL |
-| 25 | biggest buy 177.8 - 316.2 SOL |
-| 26 | biggest buy 316.2 - 562.3 SOL |
-| 27 | biggest buy 562.3 - 1000 SOL |
-| 28 | biggest buy >= 1000 SOL |
-
-</details>
-
-<details><summary><b>Whale sell vocabulary (29 ids)</b></summary>
-
-| id | meaning |
-|---|---|
-| 0 | PAD |
-| 1 | NONE (no sells in this candle) |
-| 2 | UNKNOWN (per-wallet amounts not available) |
-| 3 | biggest sell < 0.001 SOL |
-| 4 | biggest sell 0.001 - 0.001778 SOL |
-| 5 | biggest sell 0.001778 - 0.003162 SOL |
-| 6 | biggest sell 0.003162 - 0.005623 SOL |
-| 7 | biggest sell 0.005623 - 0.01 SOL |
-| 8 | biggest sell 0.01 - 0.01778 SOL |
-| 9 | biggest sell 0.01778 - 0.03162 SOL |
-| 10 | biggest sell 0.03162 - 0.05623 SOL |
-| 11 | biggest sell 0.05623 - 0.1 SOL |
-| 12 | biggest sell 0.1 - 0.1778 SOL |
-| 13 | biggest sell 0.1778 - 0.3162 SOL |
-| 14 | biggest sell 0.3162 - 0.5623 SOL |
-| 15 | biggest sell 0.5623 - 1 SOL |
-| 16 | biggest sell 1 - 1.778 SOL |
-| 17 | biggest sell 1.778 - 3.162 SOL |
-| 18 | biggest sell 3.162 - 5.623 SOL |
-| 19 | biggest sell 5.623 - 10 SOL |
-| 20 | biggest sell 10 - 17.78 SOL |
-| 21 | biggest sell 17.78 - 31.62 SOL |
-| 22 | biggest sell 31.62 - 56.23 SOL |
-| 23 | biggest sell 56.23 - 100 SOL |
-| 24 | biggest sell 100 - 177.8 SOL |
-| 25 | biggest sell 177.8 - 316.2 SOL |
-| 26 | biggest sell 316.2 - 562.3 SOL |
-| 27 | biggest sell 562.3 - 1000 SOL |
-| 28 | biggest sell >= 1000 SOL |
 
 </details>

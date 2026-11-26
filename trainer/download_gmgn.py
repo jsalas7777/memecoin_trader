@@ -269,8 +269,8 @@ def cmd_history(args, gm: GMGNClient) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", default=str(HERE / "data"))
-    p.add_argument("--rps", type=float, default=2.0,
-                   help="requests per second (default 2 = GMGN free tier; Plus ~8, Pro ~20)")
+    p.add_argument("--points", type=float, default=5.0,
+                   help="GMGN rate-limit points per second of your plan (Free 5 (default), Plus 20, Pro 50)")
     p.add_argument("--demo-key", action="store_true", help="use GMGN's public TEST key (read-only, testing only)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -292,7 +292,7 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    with GMGNClient(DEMO_KEY if args.demo_key else None, rps=args.rps) as gm:
+    with GMGNClient(DEMO_KEY if args.demo_key else None, points_per_s=args.points) as gm:
         {"discover": cmd_discover, "collect": cmd_collect, "history": cmd_history}[args.cmd](args, gm)
 
 

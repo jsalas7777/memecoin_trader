@@ -39,7 +39,8 @@ FEATURES: dict[str, tuple[str, str]] = {
     "top10_change_10": ("top10_pct - top10_pct 10 candles ago (negative = big holders selling)", "% points"),
     # --- pump.fun bonding curve ---
     "curve_progress_pct": ("pump.fun bonding curve progress at candle close (100 = curve complete / graduated). "
-                           "On-chain: from the curve vault's tokens. GMGN: from the price", "%"),
+                           "On-chain: from the curve vault's tokens. GMGN: from the price. Unknown for Mayhem-mode "
+                           "coins (pump.fun's agent moves their curve)", "%"),
     "graduated": ("1 once the bonding curve is complete or the coin trades on an AMM (PumpSwap, Raydium, ...), else 0", "0/1"),
     "curve_progress_change_10": ("curve_progress_pct - curve_progress_pct 10 candles ago", "% points"),
     # --- launch bundle ---
@@ -51,6 +52,11 @@ FEATURES: dict[str, tuple[str, str]] = {
     "max_buy_sol": ("Biggest buy by ONE wallet in the candle (its swaps summed), 0 if no buys", "SOL"),
     "max_sell_sol": ("Biggest sell by ONE wallet in the candle (its swaps summed), 0 if no sells", "SOL"),
     "max_buy_to_liquidity": ("max_buy_sol / liquidity_sol (how much one wallet moved the pool)", "ratio"),
+    # --- order flow by wallet ---
+    "unique_buyers": ("Distinct wallets that bought in the candle", "count"),
+    "unique_sellers": ("Distinct wallets that sold in the candle", "count"),
+    "new_buyers": ("Wallets buying this coin for the first time in the candle (new money)", "count"),
+    "full_exits": ("Wallets that sold (almost) their whole position in the candle: under 1% of their peak left", "count"),
     "max_sell_to_liquidity": ("max_sell_sol / liquidity_sol", "ratio"),
     # --- lifecycle ---
     "age_s": ("Seconds since the coin was launched (or since its first downloaded trade if the launch time is unknown)", "s"),
@@ -95,7 +101,8 @@ ID_COLUMNS: dict[str, str] = {
     "timestamp": "Candle open time, UTC",
     "segment": "Contiguous stretch of downloaded data within the coin (0, 1, ...). Windows never cross segments",
     "split": "train / val / test, assigned per token (all rows of a token share a split)",
-    "source": "Where the candles came from: gmgn, onchain, or gmgn+onchain (GMGN candles + on-chain holders/liquidity/trades)",
+    "source": "Where the candles came from: gmgn, onchain, gmgn+onchain (GMGN candles + on-chain holders/liquidity/trades), "
+              "or archive (a downloaded pump.fun trade archive, import_archive.py)",
 }
 
 

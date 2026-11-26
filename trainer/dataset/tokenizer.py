@@ -23,6 +23,12 @@ import pandas as pd
 
 SEQ_LEN = 120  # 120 x 30s = 60 minutes of history
 
+# The streams the model actually uses. The others (top10, trades, liquidity, bundle, whale
+# buy/sell) are still tokenized by the functions below, but they need on-chain data that the
+# keyless GMGN download doesn't have (they would be almost all UNKNOWN), so they are off.
+# Add their names back here to use them again.
+MODEL_STREAMS = ("candle_tokens", "volume_tokens", "holder_tokens", "curve_tokens")
+
 PAD = 0
 
 # ---- candle stream -------------------------------------------------------------
@@ -173,8 +179,9 @@ def curve_tokens(c: pd.DataFrame) -> np.ndarray:
     pct = c["curve_progress_pct"].to_numpy(float)
     grad = c["graduated"].to_numpy(float)
     b = np.clip(np.floor(np.nan_to_num(pct) / CURVE_STEP_PCT), 0, CURVE_BINS - 1).astype(int)
-    tok = np.where(grad == 1, CURVE_GRADUATED, CURVE_OFFSET + b)
-    return np.where(np.isnan(pct) | np.isnan(grad), CURVE_UNKNOWN, tok).astype(np.int16)
+    tok = np.where(np.isnan(pct), CURVE_UNKNOWN, CURVE_OFFSET + b)
+    tok = np.where(grad == 1, CURVE_GRADUATED, tok)   # graduated is known even when progress isn't
+    return np.where(np.isnan(grad), CURVE_UNKNOWN, tok).astype(np.int16)
 
 
 def bundle_tokens(c: pd.DataFrame) -> np.ndarray:
@@ -302,7 +309,7 @@ def liquidity_vocab() -> list[tuple[int, str]]:
 
 
 def curve_vocab() -> list[tuple[int, str]]:
-    out = [(PAD, "PAD"), (CURVE_UNKNOWN, "UNKNOWN (not a pump.fun coin, or no data)"),
+    out = [(PAD, "PAD"), (CURVE_UNKNOWN, "UNKNOWN (not a pump.fun coin, a Mayhem-mode coin, or no data)"),
            (CURVE_GRADUATED, "GRADUATED (left the bonding curve, trades on an AMM)")]
     for b in range(CURVE_BINS):
         lo, hi = b * CURVE_STEP_PCT, (b + 1) * CURVE_STEP_PCT

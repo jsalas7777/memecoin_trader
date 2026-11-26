@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import uuid
+from typing import Callable
 
 import httpx
 
@@ -29,6 +30,15 @@ HOST = "https://openapi.gmgn.ai"
 DEMO_KEY = "gmgn_solbscbaseethmonadtron"
 KLINE_PAGE = 100  # GMGN returns at most 100 candles per request (the latest ones in [from, to])
 RATE_LIMIT_ERRORS = {"RATE_LIMIT_EXCEEDED", "RATE_LIMIT_BANNED", "RATE_LIMIT_BANNED_MAX", "ERROR_RATE_LIMIT_BLOCKED"}
+# Rate-limit cost of each route (GMGN docs). Each key has a budget of points per second:
+# Free 5, Plus 20, Pro 50.
+WEIGHTS = {
+    "/v1/token/info": 1, "/v1/token/security": 1, "/v1/token/pool_info": 1,
+    "/v1/market/token_top_holders": 5, "/v1/market/token_top_traders": 5,
+    "/v1/market/token_kline": 2, "/v1/trenches": 2, "/v1/market/rank": 3,
+    "/v1/market/hot_searches": 3, "/v1/market/search": 1, "/v1/market/token_signal": 1,
+}
+PLAN_POINTS = {"free": 5.0, "plus": 20.0, "pro": 50.0}
 
 
 class GMGNError(Exception):
@@ -38,20 +48,33 @@ class GMGNError(Exception):
 class GMGNClient:
     """Synchronous, rate-limited GMGN client.
 
-    rps: request budget per second. GMGN uses a leaky bucket per key (Free 5, Plus 20,
-    Pro 50 weight/s) and kline calls weigh 2, so the free tier sustains ~2.5 klines/s.
+    points_per_s: GMGN's budget per key (Free 5, Plus 20, Pro 50). Requests are paced by
+    their weight (WEIGHTS), so the budget is never exceeded on purpose. After a rate limit
+    the pace is halved, then raised again step by step while requests succeed (the public
+    demo key is shared by everyone, so its real budget is unknown and changes).
+    on_event(kind, message, wait_s): called on rate limits ("rate_limit"), server errors
+    ("server") and network errors ("network") before waiting. sleep(seconds) does the
+    waiting (a UI can replace it to show a countdown).
     """
 
-    def __init__(self, api_key: str | None = None, rps: float = 2.0, max_ban_wait: float = 300.0,
-                 timeout: float = 30.0):
+    def __init__(self, api_key: str | None = None, points_per_s: float = PLAN_POINTS["free"],
+                 max_ban_wait: float = 330.0, timeout: float = 30.0,
+                 on_event: Callable[[str, str, float], None] | None = None,
+                 sleep: Callable[[float], None] = time.sleep):
         self.api_key = api_key or os.environ.get("GMGN_API_KEY")
         if not self.api_key:
             raise SystemExit("GMGN_API_KEY is not set. Create a key at https://gmgn.ai/ai, then\n"
                              "  export GMGN_API_KEY=...\n(or pass --demo-key to test with GMGN's public test key)")
-        self._min_interval = 1.0 / rps if rps > 0 else 0.0
+        self.max_points = points_per_s
+        self.points = points_per_s
+        self._ok_streak = 0
         self._next = 0.0
         self.max_ban_wait = max_ban_wait
+        self.on_event = on_event
+        self.sleep = sleep
         self.requests_made = 0
+        self.rate_limits = 0
+        self.rate_limit_wait_s = 0.0
         # GMGN's API only works over IPv4 (documented), so bind the socket to IPv4.
         self._http = httpx.Client(
             transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=2),
@@ -69,15 +92,23 @@ class GMGNClient:
     def __exit__(self, *exc):
         self.close()
 
-    def _throttle(self) -> None:
+    def _throttle(self, weight: float) -> None:
         now = time.monotonic()
         if self._next > now:
             time.sleep(self._next - now)
-        self._next = max(now, self._next) + self._min_interval
+        self._next = max(now, self._next) + (weight / self.points if self.points > 0 else 0.0)
+
+    def _event(self, kind: str, message: str, wait: float) -> None:
+        if self.on_event:
+            self.on_event(kind, message, wait)
+        else:
+            log.warning("GMGN %s: %s; waiting %.0fs", kind, message, wait)
+        self.sleep(wait)
 
     def _request(self, method: str, path: str, params: dict, body: dict | None = None):
+        weight = WEIGHTS.get(path, 2)
         for attempt in range(6):
-            self._throttle()
+            self._throttle(weight)
             q = {k: v for k, v in params.items() if v is not None}
             q.update(timestamp=int(time.time()), client_id=str(uuid.uuid4()))
             try:
@@ -85,30 +116,42 @@ class GMGNClient:
                                        content=json.dumps(body) if body is not None else None)
                 self.requests_made += 1
             except httpx.TransportError as e:
-                log.debug("%s %s transport error %s", method, path, e)
-                time.sleep(2 ** attempt)
+                self._event("network", f"{type(e).__name__} on {path}", 2 ** attempt)
                 continue
             try:
                 j = r.json()
             except ValueError:
-                if r.status_code >= 500:
-                    time.sleep(2 ** attempt)
+                if r.status_code == 429:
+                    j = {"error": "RATE_LIMIT_EXCEEDED"}
+                elif r.status_code >= 500:
+                    self._event("server", f"HTTP {r.status_code} on {path}", 2 ** attempt)
                     continue
-                raise GMGNError(f"{path}: HTTP {r.status_code} (non-JSON response)")
+                else:
+                    raise GMGNError(f"{path}: HTTP {r.status_code} (non-JSON response)")
             if j.get("code") == 0:
+                self._ok_streak += 1
+                if self._ok_streak >= 20 and self.points < self.max_points:
+                    self.points = min(self.max_points, self.points * 1.25)
+                    self._ok_streak = 0
                 return j.get("data")
             err = str(j.get("error") or j.get("message") or j.get("code"))
             if r.status_code == 429 or err in RATE_LIMIT_ERRORS:
                 # Retrying during a ban extends it, so wait until the reset time GMGN gives.
                 reset = r.headers.get("x-ratelimit-reset") or j.get("reset_at")
-                wait = max(float(reset) - time.time(), 0) + 1.0 if reset else 5.0 * (attempt + 1)
+                try:
+                    wait = max(float(reset) - time.time(), 0) + 1.0 if reset else 5.0 * (attempt + 1)
+                except ValueError:
+                    wait = 5.0 * (attempt + 1)
+                self.rate_limits += 1
+                self._ok_streak = 0
+                self.points = max(self.max_points / 10, self.points / 2)
                 if wait > self.max_ban_wait:
                     raise GMGNError(f"{path}: rate limited for {wait:.0f}s ({err})")
-                log.warning("GMGN rate limit (%s); waiting %.0fs", err, wait)
-                time.sleep(wait)
+                self.rate_limit_wait_s += wait
+                self._event("rate_limit", err, wait)
                 continue
             if r.status_code >= 500:
-                time.sleep(2 ** attempt)
+                self._event("server", f"HTTP {r.status_code} {err} on {path}", 2 ** attempt)
                 continue
             raise GMGNError(f"{path}: {err} {j.get('upgrade_message') or ''}".strip())
         raise GMGNError(f"{path}: gave up after retries")

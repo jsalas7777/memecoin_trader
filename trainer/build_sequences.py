@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build tokenized model inputs: 10 streams x 120 tokens.
+"""Build tokenized model inputs: one stream per input x 120 tokens.
 
-Streams: candle, volume, holders, top-10 concentration, trades per minute, liquidity,
-bonding curve progress, launch bundle, whale buy, whale sell.
+Model inputs (dataset/tokenizer.py MODEL_STREAMS): candle, volume, holders, bonding curve
+progress. Also available but switched off (need on-chain data): top-10 concentration, trades
+per minute, liquidity, launch bundle, whale buy, whale sell.
 
 Reads data/dataset/dataset_30s.csv (from build_dataset.py). For every candle t of every
 token, it takes the window of the last 120 candles (t-119 .. t), converts each candle into
@@ -32,7 +33,7 @@ from dataset.verify import Report, verify
 
 log = logging.getLogger("sequences")
 HERE = Path(__file__).resolve().parent
-STREAMS = {
+ALL_STREAMS = {
     "candle_tokens": (tk.candle_tokens, tk.CANDLE_VOCAB, tk.candle_vocab),
     "volume_tokens": (tk.volume_tokens, tk.VOLUME_VOCAB, tk.volume_vocab),
     "holder_tokens": (tk.holder_tokens, tk.HOLDERS_VOCAB, tk.holders_vocab),
@@ -44,6 +45,8 @@ STREAMS = {
     "whale_buy_tokens": (tk.whale_buy_tokens, tk.WHALE_VOCAB, tk.whale_buy_vocab),
     "whale_sell_tokens": (tk.whale_sell_tokens, tk.WHALE_VOCAB, tk.whale_sell_vocab),
 }
+# the model's inputs (see tk.MODEL_STREAMS)
+STREAMS = {k: ALL_STREAMS[k] for k in tk.MODEL_STREAMS}
 # stream -> source columns in dataset_30s.csv
 STREAM_SOURCES = {
     "candle_tokens": "`open`, `high`, `low`, `close`, `volume_sol`",
@@ -165,8 +168,8 @@ def write_markdown(args, arrays: dict | None, report: Report | None = None) -> N
 - Candles come from GMGN (30s klines from launch) and/or on-chain swaps; see the `source` column.
   A value no source has data for is the stream's `UNKNOWN` token, never a guess.
 """)
-    L.append("## ⭐ Input 1: `candle_tokens` [batch, 120]\n")
-    L.append(f"""Each candle with at least one swap becomes one of {tk.N_RET} x {tk.N_RANGE} = {tk.N_RET * tk.N_RANGE} tokens:
+    sections: dict[str, str] = {}
+    sections["candle_tokens"] = (f"""Each candle with at least one swap becomes one of {tk.N_RET} x {tk.N_RANGE} = {tk.N_RET * tk.N_RANGE} tokens:
 
 - **move** = close / previous close - 1, split into {tk.N_RET} signed bins with edges at
   ±{", ±".join(f"{e:g}%" for e in tk.RET_EDGES_PCT)}. The bins are wider in the tails, because memecoins move a lot.
@@ -176,53 +179,48 @@ def write_markdown(args, arrays: dict | None, report: Report | None = None) -> N
 `token = {tk.CANDLE_OFFSET} + move_bin x {tk.N_RANGE} + range_bin`. A candle with no swaps is `NO_TRADE`.
 For the first candle of a coin, "previous close" is its own open.
 """)
-    L.append("## ⭐ Input 2: `volume_tokens` [batch, 120]\n")
-    L.append(f"""SOL volume of the candle (buys + sells) on a log10 scale, in {tk.VOL_STEP:g}-decade steps
+    sections["volume_tokens"] = (f"""SOL volume of the candle (buys + sells) on a log10 scale, in {tk.VOL_STEP:g}-decade steps
 (each bin is ~{10 ** tk.VOL_STEP:.2f}x the previous one) from {10 ** tk.VOL_LOG10_MIN:g} SOL to {10 ** tk.VOL_LOG10_MAX:g} SOL.
 Volume is absolute, not normalized per coin, because 0.1 SOL and 100 SOL of volume mean
 very different things for a memecoin. A candle with no volume is `ZERO`.
 """)
-    L.append("## ⭐ Input 3: `holder_tokens` [batch, 120]\n")
-    L.append(f"""Number of wallets holding > 0 tokens at the close of each candle. 1-{tk.HOLDERS_EXACT} holders each have
+    sections["holder_tokens"] = (f"""Number of wallets holding > 0 tokens at the close of each candle. 1-{tk.HOLDERS_EXACT} holders each have
 their own token. Above that, each bin covers {round((tk.HOLDERS_STEP - 1) * 100)}% more holders than the previous one, so growth
 from 1,000 to 1,050 holders is still visible. `UNKNOWN` means no holder history is available.
 Holder history comes from exact on-chain balances, or else from GMGN wallet holding periods
 (exact for coins with fewer than 100 wallets, which covers most dead coins). See [DATASET.md](DATASET.md).
 """)
-    L.append("## ⭐ Input 4: `top10_tokens` [batch, 120]\n")
-    L.append(f"""% of the total supply held by the 10 largest wallets at candle close, in {tk.TOP10_STEP_PCT:g}% steps
+    sections["top10_tokens"] = (f"""% of the total supply held by the 10 largest wallets at candle close, in {tk.TOP10_STEP_PCT:g}% steps
 ({tk.TOP10_BINS} bins from 0% to 100%). Pools, bonding curves and other program-owned (PDA) accounts are
 excluded, because they're liquidity, not people who can dump. A high or rising value means a few
 wallets can crash the price. A falling value means big holders are selling or distributing.
 `UNKNOWN` means no balance data was available. This stream needs on-chain data, because GMGN
 has no top-10 history.
 """)
-    L.append("## ⭐ Input 5: `trades_tokens` [batch, 120]\n")
-    L.append(f"""Number of swaps in the last 60 seconds (the current 30s candle plus the previous one).
+    sections["trades_tokens"] = (f"""Number of swaps in the last 60 seconds (the current 30s candle plus the previous one).
 1-{tk.TRADES_EXACT} trades/min each have their own token. Above that, each bin covers {round((tk.TRADES_STEP - 1) * 100)}% more
 trades/min than the previous one. `ZERO` = no trades in the last minute (activity is dying).
 `UNKNOWN` = the trade count isn't available (GMGN candles have volume but no trade count; it is
 filled from on-chain data where that exists).
 """)
-    L.append("## ⭐ Input 6: `liquidity_tokens` [batch, 120]\n")
-    L.append(f"""Total SOL in all of the coin's pools at candle close (pump.fun bonding curve + PumpSwap /
+    sections["liquidity_tokens"] = (f"""Total SOL in all of the coin's pools at candle close (pump.fun bonding curve + PumpSwap /
 Raydium / Meteora pools), on a log10 scale in {tk.LIQ_STEP:g}-decade steps (each bin ~{10 ** tk.LIQ_STEP:.2f}x the
 previous) from {10 ** tk.LIQ_LOG10_MIN:g} SOL to {10 ** tk.LIQ_LOG10_MAX:,.0f} SOL. When a coin graduates, the emptied
 bonding curve stops counting, so liquidity is not double-counted. A sudden drop in this
 stream is liquidity being pulled. This stream needs on-chain data (GMGN has no liquidity
 history); it is `UNKNOWN` otherwise.
 """)
-    L.append("## ⭐ Input 7: `curve_tokens` [batch, 120]\n")
-    L.append(f"""How far the coin is along the pump.fun bonding curve at candle close, in {tk.CURVE_STEP_PCT:g}% steps
+    sections["curve_tokens"] = (f"""How far the coin is along the pump.fun bonding curve at candle close, in {tk.CURVE_STEP_PCT:g}% steps
 ({tk.CURVE_BINS} bins). 0% = just launched; 100% = all 793.1M sellable tokens bought and the curve is complete.
 `GRADUATED` = the coin has moved to an AMM (PumpSwap, Raydium, ...). Many coins stall and die
 just before completing the curve, and graduation itself often triggers a dump.
 On-chain: exact, from the tokens left in the curve's vault (1B at launch, 206.9M at completion).
 GMGN: from the price, using the curve's constant-product formula (within ~1 point), and
-`GRADUATED` from GMGN's migration time. `UNKNOWN` = not a pump.fun coin.
+`GRADUATED` from GMGN's migration time. `UNKNOWN` = not a pump.fun coin, or a Mayhem-mode coin
+(about 4 in 10 pump.fun launches: pump.fun's Mayhem agent trades on their curve and moves its
+reserves, so progress can't be read; `GRADUATED` is still shown when they graduate).
 """)
-    L.append("## ⭐ Input 8: `bundle_tokens` [batch, 120]\n")
-    L.append(f"""% of the total supply still held by the wallets that bought in the **launch block** (the same
+    sections["bundle_tokens"] = (f"""% of the total supply still held by the wallets that bought in the **launch block** (the same
 slot as the create transaction: the dev's own buy plus any wallets bundled with it), at candle close.
 1% steps up to 20%, then 5% steps. A big bundle means a few insiders control the supply; the
 stream falling means they are selling into buyers.
@@ -231,14 +229,32 @@ stream falling means they are selling into buyers.
 launch, or the candles are GMGN-only (this stream needs on-chain data from creation).
 Program-owned (PDA) accounts such as the curve itself are never counted.
 """)
-    L.append("## ⭐ Inputs 9 and 10: `whale_buy_tokens`, `whale_sell_tokens` [batch, 120]\n")
-    L.append(f"""The biggest amount of SOL **one wallet** bought (input 9) and sold (input 10) in the candle.
+    sections["whale_buy_tokens"] = (f"""The biggest amount of SOL **one wallet** bought (whale buy) and sold (whale sell) in the candle.
 A wallet's swaps in the same candle are added up, so splitting a buy into small swaps doesn't
 hide it. Same log scale as volume ({10 ** tk.VOL_LOG10_MIN:g} SOL to {10 ** tk.VOL_LOG10_MAX:g} SOL, {tk.VOL_STEP:g}-decade steps).
 Together with volume, it shows whether a move is one whale or many small traders; a whale
 sell next to thin liquidity is a dump warning. `NONE` = no buys (sells) in the candle.
 `UNKNOWN` = per-wallet amounts not available (GMGN candles have no trade list; on-chain fills it).
 """)
+    sections["whale_sell_tokens"] = sections["whale_buy_tokens"]
+    done: set[str] = set()
+    for n, k in enumerate(STREAMS, 1):
+        if sections[k] in done:
+            continue
+        done.add(sections[k])
+        same = [(m, j) for m, (j, _) in enumerate(STREAMS.items(), 1) if sections[j] == sections[k]]
+        nums = " and ".join(str(m) for m, _ in same)
+        names = ", ".join(f"`{j}`" for _, j in same)
+        L.append(f"## ⭐ Input{'s' if len(same) > 1 else ''} {nums}: {names} [batch, {args.seq_len}]\n")
+        L.append(sections[k])
+    off = [k for k in ALL_STREAMS if k not in STREAMS]
+    if off:
+        L.append("## Inputs switched off\n")
+        L.append("These streams exist in the code but are **not given to the model**: "
+                 + ", ".join(f"`{k}` ({STREAM_DOCS[k][0]})" for k in off)
+                 + ". They need on-chain swap data, which the keyless GMGN download (`download_free.py`) doesn't "
+                 "have, so they would be almost all `UNKNOWN`. To use them again, download on-chain data "
+                 "(`download_data.py history`) and add their names to `MODEL_STREAMS` in `dataset/tokenizer.py`.\n")
     L.append("## Targets\n")
     L.append("Each sample carries the targets of its current candle *t*, from `build_dataset.py`:\n")
     L.append("| Target | Meaning |\n|---|---|")
@@ -252,41 +268,62 @@ sell next to thin liquidity is a dump warning. `NONE` = no buys (sells) in the c
     L.append("Other arrays in the file: `mint`, `segment`, `timestamp` (unix seconds of candle *t*), `split` "
              "(train/val/test, per token) and `n_history` (real, non-PAD candles in the window). "
              "Windows never span a gap in the downloaded data: a new `segment` starts with fresh padding.\n")
-    L.append("## Suggested model\n")
-    L.append(f"""```
-candle_tokens    ─ Embedding({tk.CANDLE_VOCAB}, d) ─┐
-volume_tokens    ─ Embedding({tk.VOLUME_VOCAB}, d) ─┤
-holder_tokens    ─ Embedding({tk.HOLDERS_VOCAB}, d) ┤
-top10_tokens     ─ Embedding({tk.TOP10_VOCAB}, d) ─┼─ sum ─ + positional embedding({args.seq_len}, d)
-trades_tokens    ─ Embedding({tk.TRADES_VOCAB}, d) ─┤
-liquidity_tokens ─ Embedding({tk.LIQ_VOCAB}, d) ─┤
-curve_tokens     ─ Embedding({tk.CURVE_VOCAB}, d) ─┤
-bundle_tokens    ─ Embedding({tk.BUNDLE_VOCAB}, d) ─┤
-whale_buy_tokens ─ Embedding({tk.WHALE_VOCAB}, d) ─┤
-whale_sell_tokens─ Embedding({tk.WHALE_VOCAB}, d) ─┘
-      └─> Transformer encoder (causal or bidirectional, PAD masked)
-            └─> representation at position {args.seq_len - 1} (current candle)
-                  └─> heads: P(up 5m) [BCE], P(dump 5m) [BCE], return 5m [MSE]
+    L.append("## ⭐ The model: causal transformer, 24-candle forecast (`train.py`)\n")
+    L.append(f"""> [!IMPORTANT]
+> **Sequential training from the very first candle.** The model is causal (GPT-style): at candle *t* it
+> only sees candles 0..*t* of the coin. Every candle is a training example: candle 0 trains with
+> 1 candle of history, candle 1 with 2, and so on. **Nothing waits for {args.seq_len} candles.** Empty
+> or `UNKNOWN` inputs are ordinary tokens, so a coin trains from its first 30 seconds on.
+>
+> **Output: the next 24 candles (12 minutes) at every candle.**
+
+```
+per candle t, one token from each of the {len(STREAMS)} inputs ── Embedding per input ──┐
+coin age since launch (64 buckets) ──────────────────── Embedding ─────────────┼─ sum
+position in the window (0..{args.seq_len - 1}) ─────────────────────── Embedding ─────────────┘
+   └─> causal Transformer (default: d_model 128, 4 layers, 4 heads, ~1.3M parameters)
+         └─> at EVERY position t: 3 heads, each forecasting candles t+1 .. t+24
+               candle [24 x {tk.CANDLE_VOCAB}]  which candle token comes next (move x range, or NO_TRADE)
+               volume [24 x {tk.VOLUME_VOCAB}]  its volume token
+               ret    [24]       log(close[t+k] / close[t]): the price path from now
 ```
 
-Train on `split == "train"`, tune on `val` and report on `test`. Splits are by coin, so the test
-set only has coins the model has never seen.
+| Output | Shape | Loss | Meaning |
+|---|---|---|---|
+| `candle` | [batch, T, 24, {tk.CANDLE_VOCAB}] | cross-entropy | probabilities of each candle token for each of the next 24 candles |
+| `volume` | [batch, T, 24, {tk.VOLUME_VOCAB}] | cross-entropy (x0.5) | volume token of each of the next 24 candles |
+| `ret` | [batch, T, 24] | Huber | predicted price change from now to each of the next 24 candles (log ratio) |
+
+**How coins are fed.** Each coin (each `segment`) is one sequence starting at its first candle.
+Coins longer than {args.seq_len} candles are cut into overlapping windows ({args.seq_len} long, step {args.seq_len // 2}); the first
+window trains every position, later windows only the positions the previous one didn't reach,
+so each candle is trained exactly once per epoch, with at least {args.seq_len // 2} candles of history once
+it is past the first window. Future candles beyond the downloaded data are masked out of the loss.
+Dead coins keep 24 empty candles after their last trade, so "it dies" is a forecast the model learns.
+
+```bash
+python train.py                  # trains on data/dataset/dataset_30s.csv, best model -> data/models/transformer_30s.pt
+python train.py --quick          # 2-epoch smoke test
+python train.py --epochs 50 --d-model 256 --layers 6
+python predict.py                # print a 24-candle forecast for a test coin vs what actually happened
+```
+
+Train on `split == "train"`, early-stop on `val`, report on `test`. Splits are by coin, so the test
+set only has coins the model has never seen. Each epoch prints next-candle accuracy, the 5-minute
+return error next to the "price doesn't move" baseline, and direction accuracy on moves > 5%.
+The model is only useful where it beats that baseline on `test`.
 
 **Dead coins are in the data on purpose.** Most pump.fun launches die within minutes, so most
-samples are negative (`target_up_* = 0`, often `target_dump_* = 1`). That is the real
-distribution the model will trade in. Keep it, and handle the imbalance with class weights
-or a focal loss rather than by removing dead coins. When evaluating, check
-`outcome_dead` for the coins the model would have bought.
+forecasts are "flat / NO_TRADE / down". That is the real distribution the bot will trade in; keep
+it. When evaluating, check `outcome_dead` for the coins the model would have bought.
+
+`sequences_30s.npz` (fixed {args.seq_len}-candle windows, verified above) is still written for other
+model types:
 
 ```python
 import numpy as np
 d = np.load("data/dataset/sequences_30s.npz")
-streams = ["candle_tokens", "volume_tokens", "holder_tokens",
-           "top10_tokens", "trades_tokens", "liquidity_tokens",
-           "curve_tokens", "bundle_tokens", "whale_buy_tokens", "whale_sell_tokens"]
-x = np.stack([d[k] for k in streams], axis=-1)  # [N, {args.seq_len}, {len(STREAMS)}]
-y = d["target_up_5m"]
-train = d["split"] == "train"
+x = np.stack([d[k] for k in {list(STREAMS)}], axis=-1)  # [N, {args.seq_len}, {len(STREAMS)}]
 ```
 """)
     counts = {}

@@ -49,3 +49,8 @@ PUMP_CURVE_RESERVED_TOKENS = 206_900_000
 PUMP_CURVE_SELLABLE_TOKENS = PUMP_CURVE_START_TOKENS - PUMP_CURVE_RESERVED_TOKENS  # 793.1M
 PUMP_VIRTUAL_TOKENS = 1_073_000_000
 PUMP_VIRTUAL_SOL = 30.0
+# Mayhem mode (pump.fun variant): an extra 1B tokens go to pump.fun's Mayhem agent, a program
+# that trades on the curve and moves its virtual reserves, so the curve math above does not
+# apply. The agent trading a coin identifies it exactly (checked on a full day of launches).
+MAYHEM_AGENT = "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s"
+MAYHEM_SUPPLY = 2_000_000_000

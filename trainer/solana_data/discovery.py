@@ -93,21 +93,23 @@ async def discover_new_pumpfun(rpc: SolanaRPC, limit: int = 50, min_age_s: int =
     log.info("fetching %d pump.fun creation txs", len(sigs))
     tokens = []
     for tx in await _fetch_all(rpc, [s["signature"] for s in sigs]):
-        meta = tx["meta"]
-        pre = {b["mint"] for b in meta.get("preTokenBalances") or []}
-        new = {b["mint"] for b in meta.get("postTokenBalances") or []} - pre - NON_MEME_MINTS
-        keys = account_keys(tx)
-        for mint in new:
-            if mint not in keys:
-                continue
-            tokens.append({
-                "mint": mint,
-                "created_at": tx.get("blockTime"),
-                "creator": keys[0],
-                "creation_signature": tx["transaction"]["signatures"][0],
-                "source": "pumpfun_new",
-            })
+        tokens.extend(launches_in_tx(tx))
     return tokens
+
+
+def launches_in_tx(tx: dict) -> list[dict]:
+    """The coin(s) created by a pump.fun creation transaction."""
+    meta = tx["meta"]
+    pre = {b["mint"] for b in meta.get("preTokenBalances") or []}
+    new = {b["mint"] for b in meta.get("postTokenBalances") or []} - pre - NON_MEME_MINTS
+    keys = account_keys(tx)
+    return [{
+        "mint": mint,
+        "created_at": tx.get("blockTime"),
+        "creator": keys[0],
+        "creation_signature": tx["transaction"]["signatures"][0],
+        "source": "pumpfun_new",
+    } for mint in new if mint in keys]
 
 
 async def discover_active(rpc: SolanaRPC, programs: list[str] | None = None,

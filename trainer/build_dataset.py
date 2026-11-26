@@ -89,7 +89,7 @@ def split_segments(candles: pd.DataFrame, gaps: list[tuple[int, int]], interval:
 
 
 FLOW_COLUMNS = ["trades", "buys", "sells", "unique_traders", "buy_volume_sol", "sell_volume_sol",
-                "max_buy_sol", "max_sell_sol"]
+                "max_buy_sol", "max_sell_sol", "unique_buyers", "unique_sellers", "new_buyers", "full_exits"]
 STATE_COLUMNS = ["sol_reserve", "token_reserve", "liquidity_sol", "holders", "top10_pct",
                  "curve_progress_pct", "graduated", "bundle_pct"]
 # known once at launch, the same on every candle of the coin
@@ -153,9 +153,13 @@ def gmgn_candles(data: Path, mint: str, args, max_h) -> tuple[pd.DataFrame | Non
     """GMGN 30s klines -> evenly spaced candles. GMGN omits candles without trades, so missing
     candles are known-empty (volume 0, 0 trades). Columns GMGN can't provide (trade counts on
     traded candles, buy/sell split, liquidity, holders, top-10) are NaN = unknown."""
-    k = pd.read_csv(data / "gmgn" / "kline_30s" / f"{mint}.csv")
-    k = k.dropna(subset=["close"])
-    if k.empty:
+    try:
+        k = pd.read_csv(data / "gmgn" / "kline_30s" / f"{mint}.csv")
+    except pd.errors.EmptyDataError:
+        k = pd.DataFrame()
+    if "close" in k:
+        k = k.dropna(subset=["close"])
+    if k.empty or "close" not in k:
         return None, {"skip": "no GMGN candles"}
     sp = data / "gmgn" / "state" / f"{mint}.json"
     st = json.loads(sp.read_text()) if sp.exists() else {}
@@ -197,6 +201,7 @@ def gmgn_candles(data: Path, mint: str, args, max_h) -> tuple[pd.DataFrame | Non
     info_path = data / "gmgn" / "info" / f"{mint}.json"
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
     pump = mint.endswith("pump") or str(info.get("launchpad") or st.get("launchpad") or "").lower().startswith("pump")
+    mayhem = "mayhem" in str(info.get("launchpad_platform") or st.get("launchpad") or "").lower()
     for c in COIN_COLUMNS:
         out[c] = np.nan
     if pump:
@@ -211,7 +216,8 @@ def gmgn_candles(data: Path, mint: str, args, max_h) -> tuple[pd.DataFrame | Non
         else:
             grad = pd.Series(False, index=out.index)
         out["graduated"] = grad.astype(float)
-        out["curve_progress_pct"] = progress.where(~grad, 100.0)
+        # Mayhem-mode coins: the price doesn't follow the curve formula, so progress is unknown
+        out["curve_progress_pct"] = np.nan if mayhem else progress.where(~grad, 100.0)
     supply = st.get("supply")
     out["market_cap_sol"] = out["close"] * supply if supply else np.nan
     out = out.reset_index()
@@ -275,10 +281,31 @@ def coin_outcomes(trades: pd.DataFrame, supply: float | None, observed_until: in
     }
 
 
+def featurize(candles: pd.DataFrame, t0, horizons: dict[str, int], args) -> pd.DataFrame:
+    """Features + targets, computed per contiguous segment (never across a gap)."""
+    parts = []
+    for _, seg in candles.groupby("segment", sort=True):
+        seg = seg.reset_index(drop=True)
+        parts.append(make_targets(make_features(seg, t0), horizons, args.up_threshold, args.dump_threshold))
+    return pd.concat(parts, ignore_index=True)
+
+
+def finalize(f: pd.DataFrame, horizons: dict[str, int], keep_incomplete: bool = False) -> pd.DataFrame:
+    """Drop rows whose longest-horizon future is unknown, and order the columns."""
+    if not keep_incomplete:
+        f = f.dropna(subset=[f"target_ret_{max(horizons, key=horizons.get)}"])
+    target_cols = [c for c in f.columns if c.startswith("target_")]
+    return f[list(ID_COLUMNS) + list(FEATURES) + target_cols + list(OUTCOME_COLUMNS)]
+
+
 def build(args) -> tuple[pd.DataFrame, dict]:
     data = Path(args.data_dir)
     horizons = parse_horizons(args.horizons, args.interval)
-    max_h = pd.Timedelta(args.interval) * max(horizons.values())
+    # Dead coins: empty candles after the last trade. Rows without a known future for the longest
+    # target horizon are dropped at the end, so the tail is that horizon PLUS --tail-candles long:
+    # after the drop, --tail-candles empty candles remain, and a forecast made at the last trade
+    # sees all 24 future candles ("nothing happens", the coin is dead).
+    max_h = pd.Timedelta(args.interval) * (max(horizons.values()) + args.tail_candles)
     frames, skipped, coins = [], [], []
     catalog_path = data / "tokens.csv"
     created = {}
@@ -302,11 +329,7 @@ def build(args) -> tuple[pd.DataFrame, dict]:
         symbol = info.get("symbol") or ""
         first = candles.loc[candles["volume_sol"] > 0, "timestamp"].min()
         t0 = pd.to_datetime(created[mint], unit="s", utc=True) if pd.notna(created.get(mint)) else first
-        parts = []
-        for _, seg in candles.groupby("segment", sort=True):
-            seg = seg.reset_index(drop=True)
-            parts.append(make_targets(make_features(seg, t0), horizons, args.up_threshold, args.dump_threshold))
-        f = pd.concat(parts, ignore_index=True)
+        f = featurize(candles, t0, horizons, args)
         if oc_info.get("gaps") and source == "onchain":
             log.info("  %s: %d coverage gap(s) removed (history not fully downloaded), %d segment(s)",
                      symbol or mint[:8], oc_info["gaps"], f["segment"].nunique())
@@ -485,6 +508,9 @@ def main() -> None:
     p.add_argument("--source", choices=["auto", "gmgn", "onchain"], default="auto",
                    help="auto (default): GMGN candles + on-chain columns where available; "
                         "gmgn: GMGN only; onchain: on-chain only")
+    p.add_argument("--tail-candles", type=int, default=24,
+                   help="after a coin's last trade, keep this many empty candles at least (default 24 = "
+                        "the model's forecast length), so the model learns what dying looks like")
     p.add_argument("--min-trades", type=int, default=3,
                    help="skip coins with fewer trades (default 3; keep low so dead coins stay in)")
     p.add_argument("--val", type=float, default=0.15, help="fraction of tokens for validation")

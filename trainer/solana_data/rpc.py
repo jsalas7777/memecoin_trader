@@ -40,6 +40,7 @@ class SolanaRPC:
         max_retries: int = 8,
         timeout: float = 30.0,
         commitment: str = "confirmed",
+        on_retry=None,
     ):
         self.url = url or os.environ.get("SOLANA_RPC_URL") or DEFAULT_RPC_URL
         self.commitment = commitment
@@ -55,6 +56,8 @@ class SolanaRPC:
         )
         self._id = 0
         self.requests_made = 0
+        self.retries = 0
+        self.on_retry = on_retry  # callable(method, error, sleep_s), e.g. to report rate limits
 
     async def __aenter__(self) -> "SolanaRPC":
         return self
@@ -108,6 +111,9 @@ class SolanaRPC:
             sleep_for = float(retry_after) if retry_after and retry_after.isdigit() else delay
             sleep_for += random.uniform(0, 0.5)
             log.debug("%s failed (%s); retrying in %.1fs", method, err, sleep_for)
+            self.retries += 1
+            if self.on_retry:
+                self.on_retry(method, err, sleep_for)
             await asyncio.sleep(sleep_for)
             delay = min(delay * 2, 30.0)
         raise RuntimeError("unreachable")

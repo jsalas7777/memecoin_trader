@@ -12,7 +12,7 @@ from . import tokenizer as tk
 
 # stream -> (tokenize fn, vocab size, vocab fn, source columns, monotonic source col or None,
 #            special ids that are not part of the ordered scale)
-SPEC = {
+ALL_SPEC = {
     "candle_tokens": (tk.candle_tokens, tk.CANDLE_VOCAB, tk.candle_vocab,
                       ["open", "high", "low", "close", "trades", "volume_sol"], None, ()),
     "volume_tokens": (tk.volume_tokens, tk.VOLUME_VOCAB, tk.volume_vocab,
@@ -36,10 +36,12 @@ SPEC = {
     "whale_sell_tokens": (tk.whale_sell_tokens, tk.WHALE_VOCAB, tk.whale_sell_vocab,
                           ["max_sell_sol"], "max_sell_sol", (tk.PAD, tk.WHALE_NONE, tk.WHALE_UNKNOWN)),
 }
-UNKNOWN_IDS = {"holder_tokens": tk.HOLDERS_UNKNOWN, "top10_tokens": tk.TOP10_UNKNOWN,
+SPEC = {k: v for k, v in ALL_SPEC.items() if k in tk.MODEL_STREAMS}
+ALL_UNKNOWN_IDS = {"holder_tokens": tk.HOLDERS_UNKNOWN, "top10_tokens": tk.TOP10_UNKNOWN,
                "liquidity_tokens": tk.LIQ_UNKNOWN, "trades_tokens": tk.TRADES_UNKNOWN,
                "curve_tokens": tk.CURVE_UNKNOWN, "bundle_tokens": tk.BUNDLE_UNKNOWN,
                "whale_buy_tokens": tk.WHALE_UNKNOWN, "whale_sell_tokens": tk.WHALE_UNKNOWN}
+UNKNOWN_IDS = {k: v for k, v in ALL_UNKNOWN_IDS.items() if k in SPEC}
 
 
 class Report:

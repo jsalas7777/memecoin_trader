@@ -1,16 +1,19 @@
 """Aggregate swap trades into OHLCV candles."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
-from .constants import PUMP_CURVE_RESERVED_TOKENS, PUMP_CURVE_SELLABLE_TOKENS, PUMP_CURVE_START_TOKENS
+from .constants import (MAYHEM_AGENT, PUMP_CURVE_RESERVED_TOKENS, PUMP_CURVE_SELLABLE_TOKENS,
+                        PUMP_CURVE_START_TOKENS)
 from .holders import bundle_stats, holder_stats
 
 CANDLE_COLUMNS = [
     "timestamp", "open", "high", "low", "close", "volume_sol", "volume_token",
     "buy_volume_sol", "sell_volume_sol", "trades", "buys", "sells", "unique_traders",
     "sol_reserve", "token_reserve", "liquidity_sol", "market_cap_sol", "holders", "top10_pct",
-    "max_buy_sol", "max_sell_sol", "curve_progress_pct", "graduated",
+    "max_buy_sol", "max_sell_sol", "unique_buyers", "unique_sellers", "new_buyers", "full_exits",
+    "curve_progress_pct", "graduated",
     "bundle_pct", "bundle_launch_pct", "bundle_wallets",
 ]
 
@@ -105,13 +108,28 @@ def build_ohlcv(trades: pd.DataFrame, interval: str = "30s", supply: float | Non
     per_wallet = df.groupby([pd.Grouper(freq=interval, label="left", closed="left"), "trader"])
     out["max_buy_sol"] = per_wallet["buy_sol"].sum().groupby(level=0).max().reindex(out.index).fillna(0.0)
     out["max_sell_sol"] = per_wallet["sell_sol"].sum().groupby(level=0).max().reindex(out.index).fillna(0.0)
+    # order flow by wallet: how many wallets bought / sold, how many bought this coin for the
+    # first time, and how many sold (almost) their whole position
+    rs = lambda s, how: getattr(s.resample(interval, label="left", closed="left"), how)().reindex(out.index).fillna(0)
+    out["unique_buyers"] = rs(df.loc[is_buy, "trader"], "nunique")
+    out["unique_sellers"] = rs(df.loc[~is_buy, "trader"], "nunique")
+    first_buy = df[is_buy].reset_index().groupby("trader")["ts"].min()
+    out["new_buyers"] = rs(pd.Series(1, index=pd.DatetimeIndex(first_buy.to_numpy())).sort_index(), "sum")
+    signed = np.where(is_buy, 1.0, -1.0) * df["token_amount"].to_numpy(float)
+    wallet = df["trader"].to_numpy()
+    pos = pd.Series(signed).groupby(wallet).cumsum().to_numpy()            # tokens held after the trade
+    peak = pd.Series(pos).groupby(wallet).cummax().clip(lower=0).to_numpy()
+    dust = 0.01 * peak                                                       # < 1% of its peak = exited
+    exited = ~is_buy.to_numpy() & (peak > 0) & (pos - signed > dust) & (pos <= dust)
+    out["full_exits"] = rs(df.loc[exited, "trader"], "nunique")
 
     if end_time is not None and fill_gaps:
         end = pd.Timestamp(end_time).floor(interval)
         if end > out.index[-1]:
             out = out.reindex(pd.date_range(out.index[0], end, freq=interval, tz="UTC"))
             for col in ("volume_sol", "volume_token", "buy_volume_sol", "sell_volume_sol",
-                        "trades", "buys", "sells", "unique_traders", "max_buy_sol", "max_sell_sol"):
+                        "trades", "buys", "sells", "unique_traders", "max_buy_sol", "max_sell_sol",
+                        "unique_buyers", "unique_sellers", "new_buyers", "full_exits"):
                 out[col] = out[col].fillna(0)
             out[["trades", "buys", "sells", "unique_traders"]] = out[["trades", "buys", "sells", "unique_traders"]].astype(int)
             out.index.name = "ts"
@@ -125,6 +143,9 @@ def build_ohlcv(trades: pd.DataFrame, interval: str = "30s", supply: float | Non
 
     if pump_curve:
         out[["curve_progress_pct", "graduated"]] = _curve(df, out.index, interval)
+        if (df["trader"] == MAYHEM_AGENT).any():
+            # Mayhem-mode coin: the agent moves the curve's reserves, progress can't be read from them
+            out["curve_progress_pct"] = float("nan")
     else:
         out["curve_progress_pct"] = out["graduated"] = float("nan")
     bs, binfo = bundle_stats(balances, interval, supply, launch_slot)
