@@ -139,8 +139,8 @@ function makeRow(mint) {
     <span class="coin">
       <img alt="" hidden referrerpolicy="no-referrer"><span class="ph"></span>
       <span class="txt">
-        <a class="sym" target="_blank" rel="noopener" href="${gmgnUrl(mint)}"><span></span><span class="venue"></span></a>
-        <span class="mint">${mint.slice(0, 4)}…${mint.slice(-5)}</span>
+        <a class="sym" target="_blank" rel="noopener" href="${gmgnUrl(mint)}"><span></span></a>
+        <span class="mint">${mint.slice(0, 4)}…${mint.slice(-5)}<span class="venue"></span></span>
       </span>
     </span>
     <span class="bar"><i class="buy"></i><i class="sell"></i></span>
@@ -240,9 +240,9 @@ function renderFeed(rebuild) {
 function updateFeedHead() {
   const cutoff = (last?.now || Date.now()) - 60_000;
   if (!filterMint) {
-    const n = tradeBuf.filter((t) => t.t >= cutoff).length;
+    const perSec = last?.totals?.at(-2) ?? 0; // last complete second
     $("feedTitle").textContent = "Live trades";
-    $("feedSub").textContent = `All coins · newest first · ${fmtInt(Math.round(n / 60))} trades/s`;
+    $("feedSub").textContent = `All coins · newest first · ${fmtInt(perSec)} tx in the last full second`;
   } else {
     const recent = tradeBuf.filter((t) => t.mint === filterMint && t.t >= cutoff);
     const buys = recent.filter((t) => t.buy);

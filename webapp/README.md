@@ -40,7 +40,12 @@ Helius websocket (logsSubscribe)  ──>  server.js  ──SSE, 4×/s──>  b
   reset to zero at every second boundary.
 - **Pause** (or press space) freezes the list so you can read it. Click any row to open the coin
   on GMGN (`gmgn.ai/sol/token/<mint>`), in a new tab. The "Top coin" card links the same way.
-- Hover a row or a timeline bar for details.
+- **Live trades** panel (right): every trade as it lands — time, buy/sell, coin, SOL, wallet.
+  Click a trade to open the transaction on Solscan, the wallet to open it on GMGN, or the coin
+  to show only that coin's trades. The **Trades** button on a ranking row does the same; the
+  list then also loads that coin's trades from the last 60s and shows buy/sell totals.
+  Esc or "All coins ✕" goes back to every coin. Comes from the same stream, so no extra credits.
+- Hover a row, a trade or a timeline bar for details.
 
 ## Config (`.env`)
 
