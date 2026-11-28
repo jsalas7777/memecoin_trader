@@ -130,9 +130,20 @@ function recordAmm(ev, info) {
   record({ t: ev.t, sig: ev.sig, mint: info.mint, buy, sol, user: ev.user, venue: "pumpswap" });
 }
 
+const outbox = []; // trades not yet sent to browsers (the live trade list)
+let nextId = 1;
 function record(tr) {
   if (tr.mint === WSOL) return;
+  tr.id = nextId++;
+  tr.sol = +tr.sol.toFixed(6);
   trades.push(tr);
+  if (outbox.length < 5000) outbox.push(tr);
+}
+
+function metaFor(mints) {
+  const out = {};
+  for (const m of mints) if (meta.get(m)) out[m] = meta.get(m);
+  return out;
 }
 
 // ---------------------------------------------------------------- HTTP RPC lookups (batched, rate-friendly)
@@ -272,8 +283,12 @@ setInterval(() => { stats.msgRate = stats.msgs - lastMsgs; lastMsgs = stats.msgs
 
 const clients = new Set();
 setInterval(() => {
+  const fresh = outbox.splice(0);
   if (clients.size === 0) return;
-  const payload = `data: ${JSON.stringify(snapshot())}\n\n`;
+  const snap = snapshot();
+  snap.trades = fresh;
+  Object.assign(snap.meta, metaFor(new Set(fresh.map((t) => t.mint))));
+  const payload = `data: ${JSON.stringify(snap)}\n\n`;
   for (const res of clients) res.write(payload);
 }, TICK_MS);
 // keep pruning even with no browser open
@@ -286,8 +301,19 @@ http
     if (url.pathname === "/stream") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
       res.write("retry: 2000\n\n");
+      // Seed the trade list with the most recent trades so it isn't empty on page load.
+      const recent = trades.slice(-300);
+      res.write(`event: backfill\ndata: ${JSON.stringify({ trades: recent, meta: metaFor(new Set(recent.map((t) => t.mint))) })}\n\n`);
       clients.add(res);
       req.on("close", () => clients.delete(res));
+      return;
+    }
+    if (url.pathname === "/trades") {
+      // Every trade of one coin still in memory (last 60s), newest last.
+      const mint = url.searchParams.get("mint") || "";
+      const list = trades.filter((t) => t.mint === mint).slice(-2000);
+      if (mint && !meta.has(mint)) metaQueue.add(mint);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ trades: list, meta: metaFor([mint]) }));
       return;
     }
     const file = path.join(ROOT, "public", url.pathname === "/" ? "index.html" : path.normalize(url.pathname));

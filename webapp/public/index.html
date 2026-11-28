@@ -40,14 +40,29 @@
       </div>
     </section>
 
-    <section class="board" aria-label="Ranking">
-      <div class="thead">
-        <span>#</span><span>Coin</span><span>Transactions (buys | sells)</span>
-        <span class="num">Tx</span><span class="num">Traders</span><span class="num">SOL vol</span><span class="spark-h">Tx/s · 30s</span>
-      </div>
-      <div class="rows" id="rows"></div>
-      <p class="empty" id="empty" hidden>Waiting for trades…</p>
-    </section>
+    <div class="main">
+      <section class="board" aria-label="Ranking">
+        <div class="thead">
+          <span>#</span><span>Coin</span><span>Transactions (buys | sells)</span>
+          <span class="num">Tx</span><span class="num">Traders</span><span class="num">SOL vol</span><span class="spark-h">Tx/s · 30s</span><span></span>
+        </div>
+        <div class="rows" id="rows"></div>
+        <p class="empty" id="empty" hidden>Waiting for trades…</p>
+      </section>
+
+      <section class="feed" aria-label="Live trades">
+        <div class="feed-head">
+          <div>
+            <h2 id="feedTitle">Live trades</h2>
+            <div class="muted small" id="feedSub">All coins · newest first</div>
+          </div>
+          <button class="clear" id="feedClear" hidden title="Show all coins">All coins ✕</button>
+        </div>
+        <div class="fthead"><span>Time</span><span>Side</span><span>Coin</span><span class="num">SOL</span><span>Wallet</span><span></span></div>
+        <div class="flist" id="flist"></div>
+        <p class="empty" id="fempty">Waiting for trades…</p>
+      </section>
+    </div>
     <div class="tip" id="tip" role="tooltip" hidden></div>
   </main>
   <script src="/app.js"></script>

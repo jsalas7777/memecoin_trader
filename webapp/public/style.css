@@ -37,7 +37,7 @@ body { background: var(--page); }
   color: var(--text-primary);
   font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   padding: 24px clamp(12px, 3vw, 40px) 48px;
-  max-width: 1280px;
+  max-width: 1680px;
   margin: 0 auto;
   font-variant-numeric: tabular-nums;
 }
@@ -79,7 +79,7 @@ h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
 .timeline .b:hover { background: var(--buy); }
 
 .board { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-.thead, .row { display: grid; grid-template-columns: 36px minmax(150px, 1.3fr) minmax(160px, 2.4fr) 56px 64px 76px 128px; gap: 12px; align-items: center; padding: 0 14px; }
+.thead, .row { display: grid; grid-template-columns: 30px minmax(140px, 1.3fr) minmax(120px, 2.4fr) 48px 56px 64px 104px 58px; gap: 10px; align-items: center; padding: 0 14px; }
 .thead { height: 36px; color: var(--text-secondary); font-size: 12px; border-bottom: 1px solid var(--border); }
 .num { text-align: right; }
 .rows { position: relative; }
@@ -102,17 +102,50 @@ h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
 .bar i:only-child, .bar i.solo { border-radius: 4px; }
 .v { text-align: right; white-space: nowrap; }
 .v.tx { font-weight: 600; font-size: 15px; }
-.spark { width: 128px; height: 28px; display: block; }
+.spark { width: 104px; height: 28px; display: block; }
 .spark path { fill: none; stroke: var(--text-secondary); stroke-width: 1.5; stroke-linejoin: round; }
 .spark circle { fill: var(--text-primary); }
 .empty { text-align: center; color: var(--text-secondary); padding: 40px 0; margin: 0; }
 
-.tip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 24px rgb(0 0 0 / 0.18); max-width: 280px; }
+.tip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 24px rgb(0 0 0 / 0.18); max-width: 340px; }
 .tip b { font-weight: 600; }
 .tip .k { color: var(--text-secondary); }
+.tip .mono { font: 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 .tip .line { display: flex; justify-content: space-between; gap: 16px; }
 
+/* layout: ranking + live trades side by side */
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 12px; align-items: start; }
+@media (max-width: 1240px) { .main { grid-template-columns: 1fr; } }
+.row.selected { background: color-mix(in srgb, var(--buy) 10%, transparent); box-shadow: inset 3px 0 0 var(--buy); }
+.tbtn { font: inherit; font-size: 12px; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; cursor: pointer; }
+.tbtn:hover, .row.selected .tbtn { border-color: var(--buy); color: var(--buy); }
+
+.feed { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; position: sticky; top: 12px; display: flex; flex-direction: column; max-height: calc(100vh - 24px); }
+.feed-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.feed h2 { font-size: 15px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.small { font-size: 12px; }
+.clear { font: inherit; font-size: 12px; color: var(--text-primary); background: transparent; border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; cursor: pointer; white-space: nowrap; }
+.fthead, .ftr { display: grid; grid-template-columns: 84px 44px minmax(60px, 1fr) 64px 92px 20px; gap: 8px; align-items: center; padding: 0 14px; }
+.fthead { height: 30px; font-size: 12px; color: var(--text-secondary); border-bottom: 1px solid var(--border); flex: none; }
+.flist { overflow-y: auto; flex: 1; min-height: 120px; }
+.ftr { height: 30px; font-size: 12.5px; border-bottom: 1px solid var(--grid); cursor: pointer; }
+.ftr:hover { background: color-mix(in srgb, var(--text-primary) 5%, transparent); }
+.ftr.new { animation: flash 900ms ease-out; }
+@keyframes flash { from { background: color-mix(in srgb, var(--text-primary) 10%, transparent); } to { background: transparent; } }
+.ftr .time { color: var(--text-secondary); font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.side { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; font-size: 11.5px; }
+.side::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--buy); }
+.side.sell::before { background: var(--sell); }
+.ftr .fcoin { font: inherit; color: var(--text-primary); background: none; border: 0; padding: 0; text-align: left; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ftr .fcoin:hover { text-decoration: underline; }
+.ftr .fsol { text-align: right; }
+.ftr .fwallet { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-secondary); text-decoration: none; }
+.ftr .fwallet:hover { color: var(--text-primary); text-decoration: underline; }
+.ftr .ext { color: var(--text-secondary); text-decoration: none; text-align: center; }
+.ftr .ext:hover { color: var(--text-primary); }
+.ftr.big .fsol { font-weight: 700; }
+
 @media (max-width: 760px) {
-  .thead, .row { grid-template-columns: 28px minmax(110px, 1fr) minmax(80px, 1.2fr) 44px; }
-  .thead span:nth-child(n+5), .row > :nth-child(n+5) { display: none; }
+  .thead, .row { grid-template-columns: 26px minmax(100px, 1fr) minmax(50px, 1fr) 40px 58px; }
+  .thead span:nth-child(n+5):nth-child(-n+7), .row > :nth-child(n+5):nth-child(-n+7) { display: none; }
 }

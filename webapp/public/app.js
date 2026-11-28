@@ -9,6 +9,14 @@ let last = null;
 const rowEls = new Map(); // mint -> element
 const metaCache = {};
 
+// live trade list
+const FEED_BUF = 4000; // trades kept in the browser
+const FEED_ROWS = 250; // trades shown
+let tradeBuf = []; // newest first
+const tradeIds = new Set();
+let pendingFeed = []; // received but not drawn yet (newest first)
+let filterMint = null;
+
 // ---------------------------------------------------------------- controls
 $("windows").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-w]");
@@ -21,22 +29,31 @@ const togglePause = () => {
   paused = !paused;
   $("pause").setAttribute("aria-pressed", String(paused));
   $("pause").textContent = paused ? "Paused — resume" : "Pause";
-  if (!paused && last) render(last);
+  if (!paused && last) { render(last); renderFeed(false); }
 };
 $("pause").addEventListener("click", togglePause);
 document.addEventListener("keydown", (e) => {
   if (e.code === "Space" && e.target === document.body) { e.preventDefault(); togglePause(); }
+  if (e.key === "Escape" && filterMint) setFilter(null);
 });
+$("feedClear").addEventListener("click", () => setFilter(null));
 
 // ---------------------------------------------------------------- stream
 function connect() {
   const es = new EventSource("/stream");
+  es.addEventListener("backfill", (m) => {
+    const d = JSON.parse(m.data);
+    Object.assign(metaCache, d.meta);
+    addTrades(d.trades);
+    renderFeed(true);
+  });
   es.onmessage = (m) => {
     const snap = JSON.parse(m.data);
     Object.assign(metaCache, snap.meta);
+    addTrades(snap.trades || []);
     last = snap;
     renderStatus(snap.status);
-    if (!paused) render(snap);
+    if (!paused) { render(snap); renderFeed(false); }
   };
   es.onerror = () => renderStatus({ connected: false, error: "lost connection to local server" });
 }
@@ -82,6 +99,7 @@ function render(snap) {
       requestAnimationFrame(() => el.classList.remove("enter"));
     }
     el._data = r;
+    el.classList.toggle("selected", r.mint === filterMint);
     el.style.transform = `translateY(${i * ROW_H}px)`;
     const m = metaCache[r.mint];
     el.querySelector(".rank").textContent = i + 1;
@@ -129,12 +147,17 @@ function makeRow(mint) {
     <span class="v tx"></span>
     <span class="v tr"></span>
     <span class="v sol"></span>
-    <svg class="spark" viewBox="0 0 128 28" preserveAspectRatio="none" aria-hidden="true"><path></path><circle r="2"></circle></svg>`;
+    <svg class="spark" viewBox="0 0 128 28" preserveAspectRatio="none" aria-hidden="true"><path></path><circle r="2"></circle></svg>
+    <button class="tbtn" title="List this coin's transactions">Trades</button>`;
+  el.querySelector(".tbtn").onclick = (e) => {
+    e.stopPropagation();
+    setFilter(filterMint === mint ? null : mint);
+  };
   el.querySelector("img").onerror = function () { this.hidden = true; el.querySelector(".ph").hidden = false; };
   // Clicking anywhere on the row opens the coin on GMGN (the name link handles its own clicks,
   // so cmd/ctrl/middle-click on it still work as a normal link).
   el.addEventListener("click", (e) => {
-    if (e.target.closest("a")) return;
+    if (e.target.closest("a, button")) return;
     window.open(gmgnUrl(mint), "_blank", "noopener");
   });
   el.addEventListener("mousemove", (e) => showRowTip(e, el._data));
@@ -176,6 +199,107 @@ function renderTimeline(totals) {
   totals.forEach((v, i) => { tlBars[i]._v = v; tlBars[i].style.height = `${Math.max(2, (v / max) * 100)}%`; });
 }
 
+// ---------------------------------------------------------------- live trade list
+function addTrades(list) {
+  const fresh = [];
+  for (const t of list) {
+    if (tradeIds.has(t.id)) continue;
+    tradeIds.add(t.id);
+    fresh.push(t);
+  }
+  if (!fresh.length) return;
+  const byTime = (a, b) => b.t - a.t || b.id - a.id;
+  fresh.sort(byTime);
+  tradeBuf = fresh.concat(tradeBuf).sort(byTime);
+  if (tradeBuf.length > FEED_BUF) for (const t of tradeBuf.splice(FEED_BUF)) tradeIds.delete(t.id);
+  pendingFeed = fresh.concat(pendingFeed).slice(0, FEED_BUF);
+}
+
+function renderFeed(rebuild) {
+  const list = $("flist");
+  const match = (t) => !filterMint || t.mint === filterMint;
+  if (rebuild) {
+    pendingFeed = [];
+    list.replaceChildren(...tradeBuf.filter(match).slice(0, FEED_ROWS).map((t) => feedRow(t, false)));
+  } else {
+    const items = pendingFeed.filter(match).slice(0, FEED_ROWS);
+    pendingFeed = [];
+    if (items.length) {
+      const keepScroll = list.scrollTop > 0; // reading older trades: don't let new ones push the view
+      const before = list.scrollHeight;
+      list.prepend(...items.map((t) => feedRow(t, true)));
+      while (list.children.length > FEED_ROWS) list.lastChild.remove();
+      if (keepScroll) list.scrollTop += list.scrollHeight - before;
+    }
+  }
+  $("fempty").hidden = list.children.length > 0;
+  $("fempty").textContent = filterMint ? "No trades for this coin in the last 60s yet…" : "Waiting for trades…";
+  updateFeedHead();
+}
+
+function updateFeedHead() {
+  const cutoff = (last?.now || Date.now()) - 60_000;
+  if (!filterMint) {
+    const n = tradeBuf.filter((t) => t.t >= cutoff).length;
+    $("feedTitle").textContent = "Live trades";
+    $("feedSub").textContent = `All coins · newest first · ${fmtInt(Math.round(n / 60))} trades/s`;
+  } else {
+    const recent = tradeBuf.filter((t) => t.mint === filterMint && t.t >= cutoff);
+    const buys = recent.filter((t) => t.buy);
+    const sol = (arr) => arr.reduce((s, t) => s + t.sol, 0);
+    const m = metaCache[filterMint];
+    $("feedTitle").textContent = `Trades · ${m?.symbol || name(filterMint)}${m?.name ? " — " + m.name : ""}`;
+    $("feedSub").textContent = `Last 60s: ${fmtInt(recent.length)} trades · ${fmtInt(buys.length)} buys (${fmtSol(sol(buys))} SOL) · ${fmtInt(recent.length - buys.length)} sells (${fmtSol(sol(recent) - sol(buys))} SOL)`;
+  }
+  $("feedClear").hidden = !filterMint;
+}
+
+async function setFilter(mint) {
+  filterMint = mint;
+  for (const [m, el] of rowEls) el.classList.toggle("selected", m === mint);
+  $("flist").scrollTop = 0;
+  renderFeed(true);
+  if (!mint) return;
+  try {
+    // the server still holds the last 60s of this coin's trades, including ones before the page loaded
+    const j = await (await fetch(`/trades?mint=${encodeURIComponent(mint)}`)).json();
+    Object.assign(metaCache, j.meta);
+    addTrades(j.trades);
+    if (filterMint === mint) renderFeed(true);
+  } catch {}
+}
+
+function feedRow(t, isNew) {
+  const el = document.createElement("div");
+  el.className = `ftr${isNew ? " new" : ""}${t.sol >= 5 ? " big" : ""}`;
+  const txUrl = `https://solscan.io/tx/${t.sig}`;
+  el.innerHTML = `
+    <span class="time">${fmtTime(t.t)}</span>
+    <span class="side ${t.buy ? "buy" : "sell"}">${t.buy ? "Buy" : "Sell"}</span>
+    <button class="fcoin" title="Show only this coin's trades">${esc(name(t.mint))}</button>
+    <span class="fsol">${fmtSol(t.sol)}</span>
+    <a class="fwallet" target="_blank" rel="noopener" href="https://gmgn.ai/sol/address/${t.user}">${t.user.slice(0, 4)}…${t.user.slice(-4)}</a>
+    <a class="ext" target="_blank" rel="noopener" href="${txUrl}" aria-label="View transaction on Solscan">↗</a>`;
+  el.querySelector(".fcoin").onclick = (e) => { e.stopPropagation(); setFilter(t.mint); };
+  el.addEventListener("click", (e) => {
+    if (e.target.closest("a, button")) return;
+    window.open(txUrl, "_blank", "noopener");
+  });
+  el.addEventListener("mousemove", (e) => {
+    const m = metaCache[t.mint];
+    showTip(e, `
+      <div><span class="side ${t.buy ? "buy" : "sell"}">${t.buy ? "Buy" : "Sell"}</span> <b>${fmtSol(t.sol)} SOL</b> of <b>${esc(m?.symbol || name(t.mint))}</b> ${esc(m?.name || "")}</div>
+      <div class="line"><span class="k">Time</span><span>${new Date(t.t).toLocaleString()}</span></div>
+      <div class="line"><span class="k">Venue</span><span>${t.venue === "pumpswap" ? "PumpSwap" : "pump.fun"}</span></div>
+      <div class="k" style="margin-top:6px">Coin</div><div class="mono">${t.mint}</div>
+      <div class="k">Wallet</div><div class="mono">${t.user}</div>
+      <div class="k">Transaction</div><div class="mono">${t.sig}</div>
+      <div class="k" style="margin-top:6px">Click: Solscan · wallet: GMGN · coin: filter</div>`);
+  });
+  el.addEventListener("mouseleave", hideTip);
+  return el;
+}
+
 // ---------------------------------------------------------------- tooltip
 function showRowTip(e, r) {
   if (!r) return;
@@ -189,7 +313,7 @@ function showRowTip(e, r) {
     <div class="line"><span class="k"><i class="sw sell"></i> Sells</span><span>${fmtInt(r.sells)}</span></div>
     <div class="line"><span class="k">Unique traders</span><span>${fmtInt(r.traders)}</span></div>
     <div class="line"><span class="k">SOL volume</span><span>${fmtSol(r.sol)}</span></div>
-    <div class="k" style="margin-top:6px">Window: last ${windowSec}s · click to open on GMGN</div>`);
+    <div class="k" style="margin-top:6px">Window: last ${windowSec}s · click to open on GMGN · “Trades” lists its transactions</div>`);
 }
 function showTip(e, html) {
   tip.innerHTML = html;
@@ -208,6 +332,10 @@ function gmgnUrl(mint) { return `https://gmgn.ai/sol/token/${mint}`; }
 function name(mint) {
   const m = metaCache[mint];
   return m?.symbol ? m.symbol : `${mint.slice(0, 4)}…${mint.slice(-4)}`;
+}
+function fmtTime(t) {
+  const d = new Date(t);
+  return `${d.toLocaleTimeString([], { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
 }
 function fmtInt(n) { return Number(n).toLocaleString(); }
 function fmtSol(s) { return s >= 100 ? s.toFixed(0) : s >= 1 ? s.toFixed(2) : s >= 0.001 ? s.toFixed(3) : s > 0 ? "<0.001" : "0"; }
