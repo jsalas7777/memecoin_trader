@@ -1,0 +1,10 @@
+{
+  "name": "memecoin-live-tx",
+  "private": true,
+  "type": "module",
+  "description": "Live view of which Solana memecoins get the most transactions right now (Helius free plan)",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

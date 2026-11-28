@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Most-traded coins · live</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="viz-root">
+    <header class="top">
+      <div>
+        <h1>Most-traded coins <span class="muted">right now</span></h1>
+        <p class="sub">pump.fun + PumpSwap transactions, ranked by how many transactions touched each coin.</p>
+      </div>
+      <div class="status" id="status"><span class="dot"></span><span id="statusText">connecting…</span></div>
+    </header>
+
+    <section class="controls" aria-label="Controls">
+      <div class="seg" role="radiogroup" aria-label="Time window" id="windows">
+        <button role="radio" data-w="1" aria-checked="true">Last 1s</button>
+        <button role="radio" data-w="5" aria-checked="false">5s</button>
+        <button role="radio" data-w="30" aria-checked="false">30s</button>
+        <button role="radio" data-w="60" aria-checked="false">60s</button>
+      </div>
+      <button class="pause" id="pause" aria-pressed="false" title="Freeze the list (space)">Pause</button>
+      <div class="legend" aria-label="Legend">
+        <span><i class="sw buy"></i>Buys</span>
+        <span><i class="sw sell"></i>Sells</span>
+      </div>
+    </section>
+
+    <section class="kpis">
+      <div class="kpi"><div class="label" id="kTxLabel">Transactions · last 1s</div><div class="value" id="kTx">–</div></div>
+      <div class="kpi"><div class="label">Coins traded</div><div class="value" id="kCoins">–</div></div>
+      <div class="kpi"><div class="label">Top coin</div><a class="value small" id="kTop" target="_blank" rel="noopener" title="Open on GMGN">–</a></div>
+      <div class="kpi wide">
+        <div class="label">Transactions per second · last 60s</div>
+        <div class="timeline" id="timeline"></div>
+      </div>
+    </section>
+
+    <section class="board" aria-label="Ranking">
+      <div class="thead">
+        <span>#</span><span>Coin</span><span>Transactions (buys | sells)</span>
+        <span class="num">Tx</span><span class="num">Traders</span><span class="num">SOL vol</span><span class="spark-h">Tx/s · 30s</span>
+      </div>
+      <div class="rows" id="rows"></div>
+      <p class="empty" id="empty" hidden>Waiting for trades…</p>
+    </section>
+    <div class="tip" id="tip" role="tooltip" hidden></div>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
